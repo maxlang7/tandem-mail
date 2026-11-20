@@ -91,6 +91,36 @@ actions and sending, and Gmail settings access for server-side filters.
   background and remain available offline after downloading. The reader hides
   known tracking pixels. A remote server can still learn when Tandem fetches an
   image from it.
+- Rich mail reuses one isolated Brave renderer, pauses it between jobs, and
+  closes it after 15 seconds without work. Lossless captures preserve text,
+  inline images, and clickable link geometry. Finished captures also live in a
+  separate `render-cache.sqlite` beside the mailbox, with a 128 MiB data budget
+  and at most 256 entries. SQLite can retain up to one extra entry's allocated
+  space for reuse. Content, image, width, and density changes invalidate a
+  capture. Cache failures fall back to rendering the message.
+
+### Rendering benchmark
+
+The offline benchmark generates short notifications, long newsletters, and
+high-density messages. It never reads the mailbox or downloads images.
+
+```sh
+nix-shell --run 'cargo build --release --locked -j 3'
+python3 scripts/measure-render.py target/render-fresh target/release/tandem-mail 8
+python3 scripts/measure-render.py target/render-cached target/release/tandem-mail 8 cached
+```
+
+Fresh mode changes the document each round and includes browser startup in its
+first sample. Cached mode seeds each fixture before timing disk-cache reads;
+it includes MIME parsing, PNG decoding, and geometry restoration. These timings
+end before GPU texture upload and do not include network image downloads.
+Cached mode's total CPU measurement includes the untimed seed renders.
+JSON reports contain all samples, medians, sampled process-tree CPU time, and
+summed peak RSS. RSS counts shared memory in each process. CPU time is sampled
+every 5 ms and may miss short-lived work. Package energy is included only when
+the Linux RAPL counter is readable. CPU time alone does not prove equal wattage.
+Use `TANDEM_BENCH_IDLE=20` to keep the process alive after the benchmark for
+checking idle CPU use and renderer shutdown.
 
 ## Keyboard shortcuts
 

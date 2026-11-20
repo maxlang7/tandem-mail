@@ -33,6 +33,13 @@ fn main() -> Result<()> {
                 .join("tandem-mail")
         });
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--bench-render") {
+        return tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?
+            .block_on(html_mail::benchmark::run(&args[1..]));
+    }
     if args == ["--check-accounts"] {
         let accounts = model::accounts(&home, &dir)?;
         return tokio::runtime::Runtime::new()?.block_on(check_accounts(accounts));

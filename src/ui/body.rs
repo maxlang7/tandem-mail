@@ -280,7 +280,14 @@ async fn prepare_html(
             document = cached_document(&store, &raw).context("Missing HTML body")?;
         }
     }
-    html_mail::render(document, width, density).await.map(Some)
+    html_mail::render_cached(
+        document,
+        width,
+        density,
+        &cache.with_file_name("render-cache.sqlite"),
+    )
+    .await
+    .map(Some)
 }
 
 fn cached_document(store: &Store, raw: &[u8]) -> Option<html_mail::Document> {

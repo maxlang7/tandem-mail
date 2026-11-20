@@ -6,19 +6,32 @@ use html5ever::{parse_document, tendril::TendrilSink};
 use mail_parser::{MessageParser, MimeHeaders};
 use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use reqwest::Url;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::Semaphore,
+    sync::{Mutex, Semaphore, mpsc, oneshot},
 };
 
 use crate::message_body::{self, IMAGE_LIMIT, ImageSource};
 
+pub mod benchmark;
+mod raster_cache;
+pub use raster_cache::render_cached;
+
 const MAX_IMAGES: usize = 24 * 1024 * 1024;
 const TILE_HEIGHT: u32 = 1536;
 static RENDERER: Semaphore = Semaphore::const_new(1);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+static WORKER: Mutex<Option<mpsc::Sender<RenderJob>>> = Mutex::const_new(None);
+
+struct RenderJob {
+    document: Document,
+    width: u32,
+    density: u32,
+    reply: oneshot::Sender<Result<Page>>,
+}
 
 pub struct Document {
     html: String,
@@ -271,7 +284,7 @@ fn escape(output: &mut String, text: &str) {
     }
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Deserialize, Serialize)]
 pub struct Bounds {
     pub x: f32,
     pub y: f32,
@@ -279,19 +292,19 @@ pub struct Bounds {
     pub height: f32,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Link {
     pub url: String,
     pub bounds: Bounds,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct GifBounds {
     index: usize,
     bounds: Bounds,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Layout {
     height: u32,
     links: Vec<Link>,
@@ -306,23 +319,153 @@ pub struct Page {
     pub links: Vec<Link>,
     pub animated: Vec<(Bounds, Arc<[u8]>)>,
     pub missing: BTreeSet<Url>,
+    snapshot: Option<Snapshot>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct SnapshotSize {
+    width: u32,
+    density: u32,
+    layout: Layout,
+}
+
+struct Snapshot {
+    size: SnapshotSize,
+    png: Vec<u8>,
+}
+
+impl Snapshot {
+    async fn decode(self, document: Document) -> Result<Page> {
+        let (snapshot, tiles) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let SnapshotSize {
+                width,
+                density,
+                ref layout,
+            } = self.size;
+            ensure!(
+                (1..=1800).contains(&width)
+                    && (1..=2).contains(&density)
+                    && (1..=8200).contains(&layout.height),
+                "Invalid cached viewport"
+            );
+            let mut reader = image::ImageReader::with_format(
+                std::io::Cursor::new(&self.png),
+                image::ImageFormat::Png,
+            );
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(width * density);
+            limits.max_image_height = Some(layout.height * density);
+            limits.max_alloc = Some(128 * 1024 * 1024);
+            reader.limits(limits);
+            let pixels = reader.decode()?.into_rgba8();
+            ensure!(
+                pixels.width() == width * density && pixels.height() == layout.height * density,
+                "Unexpected HTML capture size"
+            );
+            let tile_height = TILE_HEIGHT * density;
+            let tiles = if pixels.height() <= tile_height {
+                vec![pixels]
+            } else {
+                pixels
+                    .as_raw()
+                    .chunks((pixels.width() * tile_height * 4) as usize)
+                    .map(|bytes| {
+                        image::RgbaImage::from_raw(
+                            pixels.width(),
+                            bytes.len() as u32 / (pixels.width() * 4),
+                            bytes.to_vec(),
+                        )
+                        .unwrap()
+                    })
+                    .collect()
+            };
+            Ok((self, tiles))
+        })
+        .await??;
+        Ok(Page {
+            width: snapshot.size.width,
+            height: snapshot.size.layout.height,
+            density: snapshot.size.density,
+            tiles,
+            links: snapshot.size.layout.links.clone(),
+            animated: snapshot
+                .size
+                .layout
+                .gifs
+                .iter()
+                .filter_map(|gif| Some((gif.bounds, document.animated.get(gif.index)?.clone())))
+                .collect(),
+            missing: document.missing,
+            snapshot: Some(snapshot),
+        })
+    }
 }
 
 pub async fn render(document: Document, width: u32, density: u32) -> Result<Page> {
+    ensure!(
+        (1..=1800).contains(&width) && (1..=2).contains(&density),
+        "Unsupported HTML viewport"
+    );
     let _permit = RENDERER.acquire().await?;
-    tokio::time::timeout(
-        Duration::from_secs(12),
-        render_page(document, width, density),
-    )
-    .await
-    .context("The HTML renderer timed out")?
+    let (reply, result) = oneshot::channel();
+    let mut job = RenderJob {
+        document,
+        width,
+        density,
+        reply,
+    };
+    loop {
+        let sender = {
+            let mut worker = WORKER.lock().await;
+            if worker.as_ref().is_none_or(mpsc::Sender::is_closed) {
+                let (send, receive) = mpsc::channel(1);
+                *worker = Some(send);
+                tokio::spawn(render_worker(receive));
+            }
+            worker.as_ref().unwrap().clone()
+        };
+        match sender.send(job).await {
+            Ok(()) => break,
+            // The idle deadline can expire between cloning and sending.
+            Err(error) => job = error.0,
+        }
+    }
+    result.await.context("The HTML renderer stopped")?
 }
 
-async fn render_page(document: Document, width: u32, density: u32) -> Result<Page> {
-    let mut brave = Brave::start()?;
-    let result = brave.render(document, width, density).await;
-    let _ = brave.child.kill().await;
-    result
+async fn render_worker(mut jobs: mpsc::Receiver<RenderJob>) {
+    let mut browser: Option<Brave> = None;
+    while let Ok(Some(mut job)) = tokio::time::timeout(IDLE_TIMEOUT, jobs.recv()).await {
+        if job.reply.is_closed() {
+            continue;
+        }
+        if browser.is_none() {
+            match Brave::start() {
+                Ok(brave) => browser = Some(brave),
+                Err(error) => {
+                    let _ = job.reply.send(Err(error));
+                    continue;
+                }
+            }
+        }
+        let brave = browser.as_mut().unwrap();
+        let result = tokio::select! {
+            biased;
+            // A canceled preload must not hold up the message the user clicked.
+            _ = job.reply.closed() => { browser = None; continue; }
+            result = tokio::time::timeout(Duration::from_secs(12), brave.render(job.document, job.width, job.density)) => {
+                result.context("The HTML renderer timed out").and_then(|result| result)
+            }
+        };
+        // Never reuse a partially completed CDP conversation after a failure.
+        if result.is_err() {
+            browser = None;
+        }
+        let _ = job.reply.send(result);
+    }
+    if let Some(mut brave) = browser {
+        let _ = brave.child.kill().await;
+    }
 }
 
 // DevTools drives the isolated browser over private file descriptors. The mail
@@ -333,6 +476,8 @@ struct Brave {
     from_browser: BufReader<ChildStdout>,
     serial: u32,
     session: Option<String>,
+    frame: Option<String>,
+    viewport: Option<(u32, u32)>,
     _profile: tempfile::TempDir,
 }
 
@@ -371,6 +516,8 @@ impl Brave {
             from_browser,
             serial: 0,
             session: None,
+            frame: None,
+            viewport: None,
             _profile: profile,
         })
     }
@@ -403,15 +550,22 @@ impl Brave {
     }
 
     async fn set_viewport(&mut self, width: u32, density: u32) -> Result<()> {
+        if self.viewport == Some((width, density)) {
+            return Ok(());
+        }
         self.call(
             "Emulation.setDeviceMetricsOverride",
             json!({"width":width,"height":720,"deviceScaleFactor":density,"mobile":false}),
         )
         .await?;
+        self.viewport = Some((width, density));
         Ok(())
     }
 
-    async fn render(&mut self, document: Document, width: u32, mut density: u32) -> Result<Page> {
+    async fn initialize(&mut self) -> Result<()> {
+        if self.session.is_some() {
+            return Ok(());
+        }
         let target = self
             .call("Target.createTarget", json!({"url":"about:blank"}))
             .await?;
@@ -428,18 +582,31 @@ impl Brave {
                 .to_owned(),
         );
         let frame = self.call("Page.getFrameTree", json!({})).await?;
+        self.frame = Some(
+            frame["frameTree"]["frame"]["id"]
+                .as_str()
+                .context("Missing HTML frame")?
+                .to_owned(),
+        );
         self.call("Network.enable", json!({})).await?;
         self.call(
             "Network.setBlockedURLs",
             json!({"urls":["http://*","https://*","file://*","ftp://*"]}),
         )
         .await?;
-        self.set_viewport(width, density).await?;
         self.call("Emulation.setScrollbarsHidden", json!({"hidden":true}))
             .await?;
+        Ok(())
+    }
+
+    async fn render(&mut self, document: Document, width: u32, mut density: u32) -> Result<Page> {
+        self.initialize().await?;
+        self.call("Page.setWebLifecycleState", json!({"state":"active"}))
+            .await?;
+        self.set_viewport(width, density).await?;
         self.call(
             "Page.setDocumentContent",
-            json!({"frameId":frame["frameTree"]["frame"]["id"], "html":document.html}),
+            json!({"frameId":self.frame, "html":document.html}),
         )
         .await?;
         let result = self
@@ -458,34 +625,34 @@ impl Brave {
             density = 1;
             self.set_viewport(width, density).await?;
         }
-        let mut tiles = Vec::new();
-        for y in (0..layout.height).step_by(TILE_HEIGHT as usize) {
-            let height = TILE_HEIGHT.min(layout.height - y);
-            let capture = self.call("Page.captureScreenshot", json!({
-                "format":"png", "captureBeyondViewport":true, "clip":{"x":0,"y":y,"width":width,"height":height,"scale":1}
-            })).await?;
-            let png = STANDARD.decode(
-                capture["data"]
-                    .as_str()
-                    .context("Missing rendered HTML image")?,
-            )?;
-            tiles.push(
-                image::load_from_memory_with_format(&png, image::ImageFormat::Png)?.into_rgba8(),
-            );
+        // One compositor capture avoids waiting for a new frame for each tile.
+        // Fast PNG encoding is lossless; texture tiling happens after decoding.
+        let capture = self
+            .call(
+                "Page.captureScreenshot",
+                json!({
+                    "format":"png", "optimizeForSpeed":true, "captureBeyondViewport":true,
+                    "clip":{"x":0,"y":0,"width":width,"height":layout.height,"scale":1}
+                }),
+            )
+            .await?;
+        self.call("Page.setWebLifecycleState", json!({"state":"frozen"}))
+            .await?;
+        let png = STANDARD.decode(
+            capture["data"]
+                .as_str()
+                .context("Missing rendered HTML image")?,
+        )?;
+        Snapshot {
+            size: SnapshotSize {
+                width,
+                density,
+                layout,
+            },
+            png,
         }
-        Ok(Page {
-            width,
-            height: layout.height,
-            density,
-            tiles,
-            links: layout.links,
-            animated: layout
-                .gifs
-                .into_iter()
-                .filter_map(|gif| Some((gif.bounds, document.animated.get(gif.index)?.clone())))
-                .collect(),
-            missing: document.missing,
-        })
+        .decode(document)
+        .await
     }
 }
 
@@ -585,6 +752,84 @@ mod tests {
             image.pixels().any(|pixel| *pixel == logo_color),
             "The table squeezed the logo out of view"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the local Brave browser"]
+    async fn reused_page_replaces_content_and_matches_tiled_capture() -> Result<()> {
+        let mut brave = Brave::start()?;
+        let first = from_mime(sample_html(), |_| None).unwrap();
+        brave.render(first, 1000, 2).await?;
+        let session = brave.session.clone();
+        let raw = b"Content-Type: text/html\r\n\r\n<body style=\"margin:0;background:#1b764e\"><a href=\"https://example.org/new\">New document</a><div style=\"height:3600px\"></div><p>Last tile</p></body>";
+        let page = brave
+            .render(from_mime(raw, |_| None).unwrap(), 800, 1)
+            .await?;
+        assert_eq!(brave.session, session);
+        assert_eq!(page.links.len(), 1);
+        assert_eq!(page.links[0].url, "https://example.org/new");
+        assert_eq!(page.tiles.len(), 3);
+        // Compare every pixel with the previous per-tile screenshot method.
+        brave
+            .call("Page.setWebLifecycleState", json!({"state":"active"}))
+            .await?;
+        for (tile, y) in page
+            .tiles
+            .iter()
+            .zip((0..page.height).step_by(TILE_HEIGHT as usize))
+        {
+            let capture = brave
+                .call(
+                    "Page.captureScreenshot",
+                    json!({
+                        "format":"png", "captureBeyondViewport":true,
+                        "clip":{"x":0,"y":y,"width":800,"height":tile.height(),"scale":1}
+                    }),
+                )
+                .await?;
+            let png = STANDARD.decode(capture["data"].as_str().unwrap())?;
+            let reference =
+                image::load_from_memory_with_format(&png, image::ImageFormat::Png)?.into_rgba8();
+            assert_eq!(tile, &reference, "Pixels differ on tile at {y}");
+        }
+        brave.child.kill().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the local Brave browser; checks real idle shutdown"]
+    async fn worker_recovers_from_cancellation_and_shuts_down_when_idle() -> Result<()> {
+        let (sender, receiver) = mpsc::channel(1);
+        let worker = tokio::spawn(render_worker(receiver));
+        let (reply, receive) = oneshot::channel();
+        sender
+            .send(RenderJob {
+                document: from_mime(sample_html(), |_| None).unwrap(),
+                width: 800,
+                density: 1,
+                reply,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Worker closed"))?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(receive);
+        let (reply, receive) = oneshot::channel();
+        sender
+            .send(RenderJob {
+                document: from_mime(sample_html(), |_| None).unwrap(),
+                width: 1000,
+                density: 2,
+                reply,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Worker closed"))?;
+        let page = tokio::time::timeout(Duration::from_secs(12), receive).await???;
+        assert_eq!(page.width, 1000);
+        assert_eq!(page.density, 2);
+        assert_eq!(page.links.len(), 1);
+        tokio::time::timeout(IDLE_TIMEOUT + Duration::from_secs(2), worker).await??;
+        assert!(sender.is_closed(), "Idle renderer stayed alive");
         Ok(())
     }
 }
