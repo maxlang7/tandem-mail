@@ -1,0 +1,33 @@
+[package]
+name = "tandem-mail"
+version = "0.1.0"
+edition = "2024"
+description = "Keyboard-first desktop mail for Gmail"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = "0.4"
+dirs = "7"
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+futures = "0.3"
+html2text = "0.16"
+html5ever = "0.38"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+linkify = "0.10"
+lettre = { version = "0.11", default-features = false, features = ["builder"] }
+mail-parser = "0.11"
+markup5ever_rcdom = "0.38"
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "rustls-tls"] }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+rmcp = { version = "3.11", features = ["transport-io"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+
+[profile.release]
+lto = "thin"
+strip = true
