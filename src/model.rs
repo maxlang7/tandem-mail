@@ -75,7 +75,6 @@ pub struct ThreadKey {
 #[derive(Clone, Debug)]
 pub struct Row {
     pub key: ThreadKey,
-    pub reader_message: String,
     pub senders: Vec<String>,
     pub subject: String,
     pub snippet: String,

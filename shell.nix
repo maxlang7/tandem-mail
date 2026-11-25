@@ -1,6 +1,6 @@
 { pkgs ? import <nixpkgs> {} }:
 pkgs.mkShell {
-  packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config ];
+  packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config gtk3 webkitgtk_4_1 ];
   TANDEM_MAIL_BOLD_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans-Bold.ttf";
   LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
     dbus libxkbcommon wayland libGL libglvnd

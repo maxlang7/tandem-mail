@@ -5,7 +5,7 @@ use eframe::egui::{
 
 use super::{
     DownloadFiles, MailApp, Modal, PAGE, SaveLocation,
-    body::{RenderSize, bold_family},
+    body::bold_family,
     cached_files, name, subject, tag_name,
     theme::{Icon, icon, icon_button, paint_icon_button},
 };
@@ -334,8 +334,6 @@ impl MailApp {
 
     pub(super) fn workspace(&mut self, ctx: &Context) {
         let t = self.theme;
-        let width = ctx.available_rect().width();
-        let reader_size = RenderSize::new(ctx, width - 112.);
         egui::CentralPanel::default()
             .frame(Frame::new().fill(t.canvas).inner_margin(Margin {
                 left: 5,
@@ -348,7 +346,7 @@ impl MailApp {
                     if self.open.is_some() {
                         self.reader(ui, ctx);
                     } else {
-                        self.mail_list(ui, reader_size);
+                        self.mail_list(ui);
                     }
                 });
             });
@@ -372,7 +370,7 @@ impl MailApp {
         }
     }
 
-    fn mail_list(&mut self, ui: &mut Ui, reader_size: RenderSize) {
+    fn mail_list(&mut self, ui: &mut Ui) {
         let t = self.theme;
         ui.set_min_size(ui.available_size());
         Frame::new()
@@ -462,7 +460,6 @@ impl MailApp {
         }
         let rows = self.rows.iter().take(PAGE).cloned().collect::<Vec<_>>();
         let scroll_to = std::mem::take(&mut self.scroll_cursor);
-        let mut warm = Vec::new();
         ScrollArea::vertical()
             .id_salt("mail-list")
             .auto_shrink([false, false])
@@ -472,33 +469,9 @@ impl MailApp {
                 }
                 ui.spacing_mut().item_spacing.y = 0.;
                 for (index, row) in rows.iter().enumerate() {
-                    let rect = self.mail_row(ui, row, index, scroll_to && index == self.cursor);
-                    if !self.demo
-                        && ui.is_rect_visible(rect)
-                        && !row
-                            .labels
-                            .iter()
-                            .any(|label| matches!(label.as_str(), "TRASH" | "SPAM" | "DRAFT"))
-                    {
-                        warm.push((!ui.rect_contains_pointer(rect), index != self.cursor, row));
-                    }
+                    self.mail_row(ui, row, index, scroll_to && index == self.cursor);
                 }
             });
-        if !warm.is_empty() {
-            warm.sort_by_key(|(not_hovered, not_focused, _)| (*not_hovered, *not_focused));
-            let candidates: Vec<_> = warm
-                .into_iter()
-                .take(16)
-                .map(|(_, _, row)| (row.key.account.clone(), row.reader_message.clone()))
-                .collect();
-            self.reader_content.warm(
-                ui.ctx(),
-                &self.runtime,
-                &self.path,
-                &candidates,
-                reader_size,
-            );
-        }
     }
 
     fn list_toolbar(&mut self, ui: &mut Ui) {
@@ -607,7 +580,7 @@ impl MailApp {
             });
     }
 
-    fn mail_row(&mut self, ui: &mut Ui, row: &Row, index: usize, scroll_to: bool) -> Rect {
+    fn mail_row(&mut self, ui: &mut Ui, row: &Row, index: usize, scroll_to: bool) {
         let t = self.theme;
         let width = ui.available_width();
         let compact = width < 565.;
@@ -773,7 +746,6 @@ impl MailApp {
             };
             self.change(vec![row.key.clone()], action);
         }
-        rect
     }
 
     fn row_metadata(&self, ui: &Ui, row: &Row, rect: Rect, compact: bool) -> f32 {
@@ -979,7 +951,7 @@ impl MailApp {
                 });
             });
         line(ui, t.line);
-        ScrollArea::vertical()
+        let scroll = ScrollArea::vertical()
             .id_salt(("thread", &key.account, &key.thread))
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1245,6 +1217,10 @@ impl MailApp {
                         });
                 }
             });
+        #[cfg(target_os = "linux")]
+        crate::web_reader::register_scroll_area(ctx, &scroll);
+        #[cfg(not(target_os = "linux"))]
+        let _ = scroll;
     }
 
     fn draft_list(&mut self, ui: &mut Ui) {

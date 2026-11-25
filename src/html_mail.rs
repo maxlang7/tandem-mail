@@ -34,7 +34,7 @@ struct RenderJob {
 }
 
 pub struct Document {
-    html: String,
+    pub(crate) html: String,
     animated: Vec<Arc<[u8]>>,
     pub missing: BTreeSet<Url>,
 }

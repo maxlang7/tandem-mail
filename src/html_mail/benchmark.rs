@@ -57,7 +57,7 @@ pub async fn run(args: &[String]) -> Result<()> {
             ensure!(page.links.len() == rows, "Link geometry changed");
             println!(
                 "{}",
-                json!({"case":name,"round":round,"cached":cached,"ms":start.elapsed().as_secs_f64()*1000.,"width":page.width,"height":page.height,"density":page.density,"tiles":page.tiles.len()})
+                json!({"case":name,"round":round,"cached":cached,"ms":start.elapsed().as_secs_f64()*1000.,"width":page.width,"height":page.height,"density":page.density,"tiles":page.tiles.len(),"animated_images":page.animated.len(),"missing_images":page.missing.len()})
             );
         }
     }

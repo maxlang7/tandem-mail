@@ -1,5 +1,7 @@
 # Email rendering measurements
 
+These measurements cover the previous Brave screenshot reader.
+
 Measured November 20, 2026 on Aragorn, a Framework Laptop 13 with an Intel
 Core i5-1135G7, using the project's unchanged optimized release profile.
 

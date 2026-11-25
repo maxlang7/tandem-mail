@@ -5,6 +5,23 @@ project=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 binary="$project/target/release/tandem-mail"
 environment="$project/target/tandem-launch.env"
 
+run_tandem() {
+    # With compositor scaling disabled, XWayland exposes physical pixels.
+    # Use the monitor's Wayland scale instead of letting winit infer it from DPI.
+    if [ -z "${WINIT_X11_SCALE_FACTOR:-}" ] &&
+        [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] &&
+        [ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${DISPLAY:-}" ] &&
+        command -v hyprctl >/dev/null && command -v jq >/dev/null &&
+        hyprctl -j getoption xwayland:force_zero_scaling 2>/dev/null |
+            jq -e '.int == 1' >/dev/null 2>&1 &&
+        tandem_scale=$(hyprctl monitors -j 2>/dev/null |
+            jq -er 'first(.[] | select(.focused) | .scale | numbers | select(. > 0))' 2>/dev/null)
+    then
+        export WINIT_X11_SCALE_FACTOR="$tandem_scale"
+    fi
+    exec "$binary"
+}
+
 if [ "${1:-}" = "--prepare" ] || [ "${1:-}" = "--build-and-open" ]; then
     cd "$project"
     cargo build --release --locked
@@ -12,7 +29,7 @@ if [ "${1:-}" = "--prepare" ] || [ "${1:-}" = "--build-and-open" ]; then
     printf '%s\n' "$LD_LIBRARY_PATH" "$TANDEM_MAIL_BOLD_FONT" > "$config"
     mv "$config" "$environment"
     if [ "$1" = "--prepare" ]; then exit 0; fi
-    exec "$binary"
+    run_tandem
 fi
 
 if [ -z "${TANDEM_MAIL_DIR:-}" ] && [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] &&
@@ -56,7 +73,7 @@ if [ -x "$binary" ] && [ -r "$environment" ]; then
     IFS=$saved_ifs
     if [ "$runtime_ok" = true ] && [ -r "$TANDEM_MAIL_BOLD_FONT" ]; then
         export LD_LIBRARY_PATH TANDEM_MAIL_BOLD_FONT
-        exec "$binary"
+        run_tandem
     fi
 fi
 

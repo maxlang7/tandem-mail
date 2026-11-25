@@ -12,6 +12,8 @@ mod search;
 mod store;
 mod sync;
 mod ui;
+#[cfg(target_os = "linux")]
+mod web_reader;
 
 use std::{
     fs::{DirBuilder, File, OpenOptions},
@@ -80,13 +82,20 @@ fn main() -> Result<()> {
     }
     let demo = args == ["--demo"];
     anyhow::ensure!(demo || args.is_empty(), "{USAGE}");
-    let native = eframe::NativeOptions {
+    let mut native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1320., 840.])
             .with_min_inner_size([780., 520.])
             .with_app_id("io.tandem_mail.TandemMail"),
         ..Default::default()
     };
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_some() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        native.event_loop_builder = Some(Box::new(|builder| {
+            builder.with_x11();
+        }));
+    }
     eframe::run_native(
         "Tandem Mail",
         native,
@@ -101,6 +110,12 @@ fn main() -> Result<()> {
             });
             Ok(Box::new(Desktop {
                 state: DesktopState::Loading(rx),
+                #[cfg(target_os = "linux")]
+                reader: web_reader::Reader::new(cc)
+                    .map_err(|error| {
+                        eprintln!("HTML reader: {error:#}");
+                    })
+                    .ok(),
             }))
         }),
     )
@@ -120,6 +135,8 @@ enum DesktopState {
 
 struct Desktop {
     state: DesktopState,
+    #[cfg(target_os = "linux")]
+    reader: Option<web_reader::Reader>,
 }
 
 impl eframe::App for Desktop {
@@ -137,7 +154,20 @@ impl eframe::App for Desktop {
         }
 
         if let DesktopState::Ready(mailbox) = &mut self.state {
+            #[cfg(target_os = "linux")]
+            if let Some(reader) = &mut self.reader {
+                for url in reader.begin_frame(ctx) {
+                    mailbox.app.open_mail_link(&url);
+                }
+            }
             mailbox.app.update(ctx, frame);
+            #[cfg(target_os = "linux")]
+            if let Some(reader) = &mut self.reader {
+                reader.end_frame(
+                    ctx,
+                    mailbox.app.reader_is_covered() || egui::Popup::is_any_open(ctx),
+                );
+            }
             return;
         }
         egui::CentralPanel::default()
@@ -159,6 +189,10 @@ impl eframe::App for Desktop {
                     );
                 });
             });
+    }
+    #[cfg(target_os = "linux")]
+    fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+        self.reader = None;
     }
 }
 
