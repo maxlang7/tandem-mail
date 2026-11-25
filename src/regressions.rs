@@ -239,6 +239,15 @@ fn draft_snapshot_round_trips_reply_headers_and_offline_attachments() -> anyhow:
     assert_eq!(draft.thread.as_deref(), Some("thread1"));
     draft.bcc = "hidden@example.com".into();
     draft.body = "Thanks, here's the copy.".into();
+    draft.formatting = vec![crate::compose_format::Span {
+        chars: 19..23,
+        style: crate::compose_format::Style {
+            bold: true,
+            italic: true,
+            link: Some("https://example.com/copy?one=1&two=2".into()),
+            ..Default::default()
+        },
+    }];
     draft.files.push(DraftFile {
         name: "calibration.csv".into(),
         source: DraftFileSource::Cached {
@@ -252,7 +261,9 @@ fn draft_snapshot_round_trips_reply_headers_and_offline_attachments() -> anyhow:
     assert!(store.drafts()?.is_empty());
     assert!(!store.send_waiting(&account.id)?);
     assert!(store.next_send(&account.id)?.is_none());
-    assert_eq!(store.cancel_send(queued)?.unwrap().body, draft.body);
+    let restored = store.cancel_send(queued)?.unwrap();
+    assert_eq!(restored.body, draft.body);
+    assert_eq!(restored.formatting, draft.formatting);
 
     let queued = store.queue(&mut draft, &account, now() - 1)?;
     let wire = store.next_send(&account.id)?.unwrap();
@@ -264,6 +275,14 @@ fn draft_snapshot_round_trips_reply_headers_and_offline_attachments() -> anyhow:
     assert!(text.contains("In-Reply-To: <report@example.com>"));
     assert!(text.contains("References: <previous@example.com> <report@example.com>"));
     assert!(text.contains("Bcc: hidden@example.com"));
+    assert!(text.contains("Content-Type: multipart/alternative"));
+    let message = mail_parser::MessageParser::default()
+        .parse(raw.as_slice())
+        .unwrap();
+    assert_eq!(message.body_text(0).unwrap().trim(), draft.body);
+    assert!(message.body_html(0).unwrap().contains(
+        r#"<a href="https://example.com/copy?one=1&amp;two=2"><strong><em>copy</em></strong></a>"#
+    ));
     assert_eq!(mime::attachment(&raw, 0)?, b"a,b\n1,2\n");
     store.recover_send()?;
     assert!(store.next_send(&account.id)?.is_none());
@@ -316,11 +335,12 @@ fn queued_archive_masks_stale_sync_and_keeps_the_thread_in_all_mail() -> anyhow:
     let archive = Action::labels(&[], &["INBOX"]);
     assert_eq!(
         store.queue_mailbox_changes(std::slice::from_ref(&home), &archive)?,
-        1
+        vec![home.clone()]
     );
-    assert_eq!(
-        store.queue_mailbox_changes(std::slice::from_ref(&home), &archive)?,
-        0
+    assert!(
+        store
+            .queue_mailbox_changes(std::slice::from_ref(&home), &archive)?
+            .is_empty()
     );
     store.apply_messages("home", 1, vec![remote(&["INBOX", "UNREAD"], false)], &[])?;
     assert_eq!(

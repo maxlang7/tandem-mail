@@ -36,6 +36,8 @@ struct ReaderMessage {
     images: HashMap<usize, Asset>,
     raw: Option<Arc<[u8]>>,
     html: HtmlReader,
+    attachments: Vec<(usize, Arc<[u8]>)>,
+    attachment_images: HashMap<usize, Asset>,
 }
 
 impl ReaderMessage {
@@ -334,6 +336,8 @@ struct AnimatedImage {
     decoded: DecodedImage,
     started: Option<Instant>,
     frame: usize,
+    dark_texture: Option<Option<TextureHandle>>,
+    show_original: bool,
 }
 
 impl AnimatedImage {
@@ -348,7 +352,41 @@ impl AnimatedImage {
             decoded,
             started: None,
             frame: 0,
+            dark_texture: None,
+            show_original: false,
         }
+    }
+
+    fn attachment_texture(&mut self, ui: &mut Ui, dark: bool) -> TextureHandle {
+        if dark {
+            let adapted = self.dark_texture.get_or_insert_with(|| {
+                // Keep animation and photographic colors intact.
+                (self.decoded.frames.len() == 1)
+                    .then(|| dark_document_image(&self.decoded.frames[0].0))
+                    .flatten()
+                    .map(|pixels| {
+                        ui.ctx().load_texture(
+                            format!("{}:dark", self.texture.name()),
+                            pixels,
+                            TextureOptions::LINEAR,
+                        )
+                    })
+            });
+            if let Some(texture) = adapted {
+                let label = if self.show_original {
+                    "Use dark image"
+                } else {
+                    "Show original image"
+                };
+                if ui.small_button(label).clicked() {
+                    self.show_original = !self.show_original;
+                }
+                if !self.show_original {
+                    return texture.clone();
+                }
+            }
+        }
+        self.texture(ui.ctx()).clone()
     }
 
     fn texture(&mut self, ctx: &egui::Context) -> &TextureHandle {
@@ -380,6 +418,60 @@ impl AnimatedImage {
     }
 }
 
+// Recognize light paper even under warm lighting and uneven camera exposure.
+// Require a dominant light background and sparse dark ink to avoid ordinary photos.
+fn dark_document_image(image: &ColorImage) -> Option<ColorImage> {
+    let [width, height] = image.size;
+    if width < 32 || height < 32 {
+        return None;
+    }
+    let mut samples = 0usize;
+    let mut neutral = 0usize;
+    let mut ink = 0usize;
+    let mut light = [0usize; 16];
+    let step = image.pixels.len().div_ceil(16000).max(1);
+    for pixel in image.pixels.iter().step_by(step) {
+        let [r, g, b, a] = pixel.to_srgba_unmultiplied();
+        if a < 240 {
+            return None;
+        }
+        samples += 1;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        neutral += usize::from(max - min < 48);
+        let luminance = (r as usize * 3 + g as usize * 6 + b as usize) / 10;
+        light[luminance / 16] += 1;
+        ink += usize::from(luminance < 110);
+    }
+    let paper = (10..16).max_by_key(|&i| light[i]).unwrap();
+    let paper_pixels: usize = light[paper.saturating_sub(2)..=(paper + 2).min(15)]
+        .iter()
+        .sum();
+    let border_light = (0..width)
+        .flat_map(|x| [x, (height - 1) * width + x])
+        .chain((0..height).flat_map(|y| [y * width, y * width + width - 1]))
+        .filter(|&i| {
+            let p = image.pixels[i];
+            (p.r() as usize * 3 + p.g() as usize * 6 + p.b() as usize) / 10 >= 150
+        })
+        .count();
+    if neutral * 100 < samples * 90
+        || paper_pixels * 100 < samples * 75
+        || ink * 100 < samples
+        || ink * 100 > samples * 25
+        || border_light * 100 < (2 * width + 2 * height) * 50
+    {
+        return None;
+    }
+    let mut adapted = image.clone();
+    for pixel in &mut adapted.pixels {
+        let [r, g, b, a] = pixel.to_srgba_unmultiplied();
+        let channel = |value: u8| 40 + ((255 - value) as u16 * 195 / 255) as u8;
+        *pixel = egui::Color32::from_rgba_unmultiplied(channel(r), channel(g), channel(b), a);
+    }
+    Some(adapted)
+}
+
 pub(super) fn load_font(ctx: &egui::Context) {
     if let Some(path) = std::env::var_os("TANDEM_MAIL_BOLD_FONT")
         && let Ok(bytes) = std::fs::read(path)
@@ -405,6 +497,50 @@ pub(super) fn bold_family(ctx: &egui::Context) -> Option<FontFamily> {
 }
 
 impl MailApp {
+    pub(super) fn attachment_previews(&mut self, ui: &mut Ui, key: &ThreadKey, message: &Message) {
+        let reader_key = (key.account.clone(), message.id.clone());
+        let Some(cached) = self.reader_content.get_mut(&reader_key) else {
+            return;
+        };
+        for (index, bytes) in &cached.attachments {
+            let name = message
+                .files
+                .iter()
+                .find(|(i, _)| i == index)
+                .map(|(_, name)| name.as_str())
+                .unwrap_or("Image attachment");
+            let source = ImageSource::Local(bytes.clone());
+            let state = cached.attachment_images.entry(*index).or_insert_with(|| {
+                start_image(&self.runtime, ui.ctx(), self.path.clone(), &source)
+            });
+            state.poll(ui.ctx(), || {
+                format!("attachment:{}:{}:{index}", key.account, message.id)
+            });
+            match state {
+                Asset::Ready(image) => {
+                    ui.label(self.theme.muted(name));
+                    let texture = image.attachment_texture(ui, self.theme.dark);
+                    let native = texture.size_vec2();
+                    let scale = (ui.available_width().min(750.) / native.x).min(1.);
+                    ui.add(egui::Image::new((texture.id(), native * scale)).alt_text(name));
+                    ui.add_space(8.);
+                }
+                Asset::Loading(_) => {
+                    ui.spinner();
+                }
+                Asset::Failed(error) => {
+                    if ui
+                        .small_button(format!("Retry preview · {name}"))
+                        .on_hover_text(error.as_str())
+                        .clicked()
+                    {
+                        *state = start_image(&self.runtime, ui.ctx(), self.path.clone(), &source);
+                    }
+                }
+            }
+        }
+    }
+
     pub(super) fn message_body(&mut self, ui: &mut Ui, key: &ThreadKey, message: &Message) {
         let reader_key = (key.account.clone(), message.id.clone());
         let cached = if self.demo {
@@ -860,6 +996,50 @@ fn color_image(pixels: image::RgbaImage) -> Arc<ColorImage> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dark_images_recognize_warm_paper_with_shadows_and_a_table_edge() {
+        let mut paper = egui::ColorImage::filled([240, 100], egui::Color32::WHITE);
+        for y in 0..100 {
+            for x in 0..240 {
+                let color = if y < 3 {
+                    egui::Color32::from_rgb(135, 109, 65)
+                } else if (30..210).contains(&x) && (40..44).contains(&y) {
+                    egui::Color32::from_rgb(28, 26, 22)
+                } else {
+                    let shade = 225 - (y / 2) as u8;
+                    egui::Color32::from_rgb(shade, shade, shade - 18)
+                };
+                paper.pixels[y * 240 + x] = color;
+            }
+        }
+        assert!(super::dark_document_image(&paper).is_some());
+    }
+
+    #[test]
+    fn dark_images_adapt_documents_but_preserve_photos_and_transparency() {
+        let mut document = egui::ColorImage::filled([100, 100], egui::Color32::WHITE);
+        for y in 20..80 {
+            for x in 20..25 {
+                document.pixels[y * 100 + x] = egui::Color32::BLACK;
+            }
+        }
+        let dark = super::dark_document_image(&document).unwrap();
+        assert_eq!(dark.pixels[0], egui::Color32::from_gray(40));
+        assert_eq!(dark.pixels[2020], egui::Color32::from_gray(235));
+        assert_eq!(document.pixels[0], egui::Color32::WHITE);
+        let mut photo = document.clone();
+        for (i, pixel) in photo.pixels.iter_mut().enumerate() {
+            *pixel = egui::Color32::from_rgb((i % 256) as u8, ((i / 7) % 256) as u8, 180);
+        }
+        assert!(super::dark_document_image(&photo).is_none());
+        document.pixels[0] = egui::Color32::TRANSPARENT;
+        assert!(super::dark_document_image(&document).is_none());
+        assert!(
+            super::dark_document_image(&egui::ColorImage::filled([100, 100], egui::Color32::BLACK))
+                .is_none()
+        );
+    }
+
     use super::*;
 
     #[test]

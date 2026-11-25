@@ -113,6 +113,8 @@ pub struct Draft {
     pub bcc: String,
     pub subject: String,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formatting: Vec<crate::compose_format::Span>,
     pub files: Vec<DraftFile>,
     pub thread: Option<String>,
     pub in_reply_to: Option<String>,

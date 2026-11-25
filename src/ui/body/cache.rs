@@ -235,8 +235,18 @@ impl Entry {
         let images: usize = reader
             .images
             .values()
+            .chain(reader.attachment_images.values())
             .filter_map(|asset| match asset {
-                Asset::Ready(image) => Some(image.decoded.bytes()),
+                Asset::Ready(image) => Some(
+                    image.decoded.bytes()
+                        + image
+                            .dark_texture
+                            .as_ref()
+                            .and_then(Option::as_ref)
+                            .map_or(0, |texture| {
+                                texture.size().into_iter().product::<usize>() * 4
+                            }),
+                ),
                 _ => None,
             })
             .sum();
@@ -251,7 +261,12 @@ impl Entry {
                     .map(|(_, image)| image.decoded.bytes())
                     .sum::<usize>()
         });
-        mime + images + html
+        let attachments: usize = reader
+            .attachments
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum();
+        mime + images + html + attachments
     }
 }
 
@@ -262,13 +277,35 @@ fn reader_message(store: &Store, key: &MessageKey, raw: Vec<u8>, plain: &str) ->
     } else {
         BodyView::Auto
     };
+    let attachments = attached_images(&raw);
     ReaderMessage {
+        attachments,
+        attachment_images: HashMap::new(),
         raw: body.layout.is_some().then(|| Arc::from(raw)),
         body,
         view,
         images: HashMap::new(),
         html: HtmlReader::default(),
     }
+}
+
+fn attached_images(raw: &[u8]) -> Vec<(usize, Arc<[u8]>)> {
+    use mail_parser::MimeHeaders;
+    let Some(message) = mail_parser::MessageParser::default().parse(raw) else {
+        return Vec::new();
+    };
+    message
+        .attachments()
+        .enumerate()
+        .filter_map(|(index, part)| {
+            let bytes = part.contents();
+            let is_image = part
+                .content_type()
+                .is_some_and(|kind| kind.c_type.eq_ignore_ascii_case("image"))
+                || image::guess_format(bytes).is_ok();
+            is_image.then(|| (index, Arc::from(bytes)))
+        })
+        .collect()
 }
 
 async fn prepare_reader(
@@ -355,6 +392,25 @@ mod tests {
 
     use super::*;
     use crate::model::RemoteMessage;
+
+    #[test]
+    fn attached_images_preserve_download_indices_and_decoded_bytes() {
+        let raw = concat!(
+            "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=parts\r\n\r\n",
+            "--parts\r\nContent-Type: text/plain\r\n\r\nBody\r\n",
+            "--parts\r\nContent-Type: text/plain\r\n",
+            "Content-Disposition: attachment; filename=notes.txt\r\n\r\nNotes\r\n",
+            "--parts\r\nContent-Type: image/png\r\n",
+            "Content-Disposition: attachment; filename=photo.png\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n",
+            "--parts--\r\n"
+        );
+        let images = attached_images(raw.as_bytes());
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].0, 1);
+        assert_eq!(images[0].1.as_ref(), b"hello");
+        assert!(attached_images(b"plain message").is_empty());
+    }
 
     #[test]
     #[ignore = "requires the local Brave browser"]

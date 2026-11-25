@@ -190,10 +190,24 @@ pub fn encode_with_id(
         builder = builder.references(value.clone());
     }
     let text = SinglePart::plain(draft.body.clone());
+    let alternative = (!draft.formatting.is_empty()).then(|| {
+        MultiPart::alternative()
+            .singlepart(SinglePart::plain(draft.body.clone()))
+            .singlepart(SinglePart::html(crate::compose_format::html(
+                &draft.body,
+                &draft.formatting,
+            )))
+    });
     let mail = if draft.files.is_empty() {
-        builder.singlepart(text)?
+        match alternative {
+            Some(parts) => builder.multipart(parts)?,
+            None => builder.singlepart(text)?,
+        }
     } else {
-        let mut mixed = MultiPart::mixed().singlepart(text);
+        let mut mixed = match alternative {
+            Some(parts) => MultiPart::mixed().multipart(parts),
+            None => MultiPart::mixed().singlepart(text),
+        };
         let mut available = MAX_ATTACHMENTS;
         for file in &draft.files {
             let bytes = load(&file.source)?;

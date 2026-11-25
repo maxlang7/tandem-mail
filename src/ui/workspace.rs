@@ -231,6 +231,44 @@ impl MailApp {
             });
     }
 
+    pub(super) fn archive_undo(&mut self, ctx: &Context) {
+        const WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+        let now = std::time::Instant::now();
+        self.recent_archives
+            .retain(|_, archived_at| now.duration_since(*archived_at) < WINDOW);
+        let Some(oldest) = self.recent_archives.values().min() else {
+            return;
+        };
+        ctx.request_repaint_after(WINDOW - now.duration_since(*oldest));
+
+        let count = self.recent_archives.len();
+        let caption = if count == 1 {
+            "Thread archived".to_owned()
+        } else {
+            format!("{count} threads archived")
+        };
+        let mut undo = false;
+        egui::Area::new(Id::new("archive_undo"))
+            .movable(false)
+            .anchor(Align2::RIGHT_BOTTOM, vec2(-16., -44.))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(caption);
+                        undo = ui.button("Undo").clicked();
+                    });
+                });
+            });
+        if undo {
+            let keys = self.recent_archives.keys().cloned().collect();
+            if self.change(keys, Action::labels(&["INBOX"], &[])) {
+                self.recent_archives.clear();
+                self.toast("Archive undone", false);
+            }
+        }
+    }
+
     pub(super) fn footer(&mut self, ctx: &Context) {
         let t = self.theme;
         egui::TopBottomPanel::bottom("bottom")
@@ -297,28 +335,7 @@ impl MailApp {
     pub(super) fn workspace(&mut self, ctx: &Context) {
         let t = self.theme;
         let width = ctx.available_rect().width();
-        let split = self.open.is_some() && width >= 870.;
-        let list_width = if width >= 870. {
-            (width * 0.43).clamp(340., 500.)
-        } else {
-            0.
-        };
-        // Match the reader's panel, card and message margins. The reader can
-        // paint a nearby cached size immediately, then refine it after a resize.
-        let reader_size = RenderSize::new(ctx, width - list_width - 56.);
-        if split {
-            egui::SidePanel::left("list-panel")
-                .exact_width(list_width)
-                .resizable(false)
-                .frame(
-                    Frame::new()
-                        .fill(t.canvas)
-                        .inner_margin(Margin::symmetric(5, 2)),
-                )
-                .show(ctx, |ui| {
-                    t.card(1).show(ui, |ui| self.mail_list(ui, reader_size));
-                });
-        }
+        let reader_size = RenderSize::new(ctx, width - 112.);
         egui::CentralPanel::default()
             .frame(Frame::new().fill(t.canvas).inner_margin(Margin {
                 left: 5,
@@ -330,10 +347,8 @@ impl MailApp {
                 t.card(1).show(ui, |ui| {
                     if self.open.is_some() {
                         self.reader(ui, ctx);
-                    } else if !split {
-                        self.mail_list(ui, reader_size);
                     } else {
-                        ui.set_min_size(ui.available_size());
+                        self.mail_list(ui, reader_size);
                     }
                 });
             });
@@ -964,31 +979,35 @@ impl MailApp {
                 });
             });
         line(ui, t.line);
-        Frame::new()
-            .inner_margin(Margin::symmetric(20, 13))
-            .show(ui, |ui| {
-                ui.add(Label::new(RichText::new(title).size(24.).strong()).wrap());
-                ui.label(t.muted(account).size(12.));
-            });
-        line(ui, t.line);
         ScrollArea::vertical()
             .id_salt(("thread", &key.account, &key.thread))
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                Frame::new()
+                    .inner_margin(Margin {
+                        left: 72,
+                        right: 24,
+                        top: 22,
+                        bottom: 20,
+                    })
+                    .show(ui, |ui| {
+                        ui.add(Label::new(RichText::new(title).size(25.)).wrap());
+                        ui.label(t.muted(account).size(12.));
+                    });
                 let messages = self.messages.clone();
                 for message in messages
                     .iter()
                     .filter(|m| is_draft || !m.labels.iter().any(|label| label == "DRAFT"))
                 {
                     Frame::new()
-                        .inner_margin(Margin::symmetric(16, 11))
+                        .inner_margin(Margin::symmetric(24, 14))
                         .show(ui, |ui| {
                             let open = self.expanded.contains(&message.id);
                             let head = ui.horizontal(|ui| {
                                 let (avatar, toggle) =
-                                    ui.allocate_exact_size(vec2(31., 31.), Sense::click());
+                                    ui.allocate_exact_size(vec2(40., 40.), Sense::click());
                                 let (bg, fg) = t.account(&key.account);
-                                ui.painter().circle_filled(avatar.center(), 14., bg);
+                                ui.painter().circle_filled(avatar.center(), 19., bg);
                                 let initials = name(&message.sender)
                                     .split_whitespace()
                                     .take(2)
@@ -1029,148 +1048,201 @@ impl MailApp {
                             });
                             head.response.on_hover_text(&message.sender);
                             if open {
-                                let mut parties = format!("To {}", message.recipients);
-                                if !message.cc.is_empty() {
-                                    parties.push_str(&format!("  ·  Cc {}", message.cc));
-                                }
-                                if !message.bcc.is_empty() {
-                                    parties.push_str(&format!("  ·  Bcc {}", message.bcc));
-                                }
-                                ui.label(t.muted(parties).size(12.));
-                                ui.add_space(13.);
-                                self.message_body(ui, &key, message);
-                                ui.add_space(14.);
-                                ui.horizontal_wrapped(|ui| {
-                                    for (index, file) in &message.files {
-                                        let button = ui
-                                            .button(format!("↓  {file}"))
-                                            .on_hover_text("Choose a download folder");
-                                        if button.clicked() {
-                                            self.save_file(
-                                                ctx,
-                                                &key,
-                                                &message.id,
-                                                Download::Attachment(*index),
-                                                file,
-                                                SaveLocation::ChooseFolder,
-                                            );
+                                Frame::new()
+                                    .inner_margin(Margin {
+                                        left: 48,
+                                        right: 0,
+                                        top: 0,
+                                        bottom: 10,
+                                    })
+                                    .show(ui, |ui| {
+                                        let mut parties = format!("To {}", message.recipients);
+                                        if !message.cc.is_empty() {
+                                            parties.push_str(&format!("  ·  Cc {}", message.cc));
                                         }
-                                        button.context_menu(|ui| {
-                                            if ui.button("Download to…").clicked() {
-                                                self.save_file(
+                                        if !message.bcc.is_empty() {
+                                            parties.push_str(&format!("  ·  Bcc {}", message.bcc));
+                                        }
+                                        ui.label(t.muted(parties).size(12.));
+                                        ui.add_space(13.);
+                                        self.message_body(ui, &key, message);
+                                        if !message.files.is_empty() {
+                                            ui.add_space(14.);
+                                            ui.separator();
+                                            ui.label(RichText::new("Attachments").strong());
+                                            self.attachment_previews(ui, &key, message);
+                                        }
+                                        ui.add_space(14.);
+                                        ui.horizontal_wrapped(|ui| {
+                                            for (index, file) in &message.files {
+                                                let button = ui
+                                                    .button(format!("↓  {file}"))
+                                                    .on_hover_text("Choose a download folder");
+                                                if button.clicked() {
+                                                    self.save_file(
+                                                        ctx,
+                                                        &key,
+                                                        &message.id,
+                                                        Download::Attachment(*index),
+                                                        file,
+                                                        SaveLocation::ChooseFolder,
+                                                    );
+                                                }
+                                                button.context_menu(|ui| {
+                                                    if ui.button("Download to…").clicked() {
+                                                        self.save_file(
+                                                            ctx,
+                                                            &key,
+                                                            &message.id,
+                                                            Download::Attachment(*index),
+                                                            file,
+                                                            SaveLocation::ChooseFolder,
+                                                        );
+                                                        ui.close();
+                                                    }
+                                                    if ui.button("Save to Downloads").clicked() {
+                                                        self.save_file(
+                                                            ctx,
+                                                            &key,
+                                                            &message.id,
+                                                            Download::Attachment(*index),
+                                                            file,
+                                                            SaveLocation::Downloads,
+                                                        );
+                                                        ui.close();
+                                                    }
+                                                });
+                                            }
+                                            if message.files.len() > 1
+                                                && ui.button("Download all").clicked()
+                                            {
+                                                self.save_files(
                                                     ctx,
                                                     &key,
                                                     &message.id,
-                                                    Download::Attachment(*index),
-                                                    file,
+                                                    DownloadFiles::Attachments(
+                                                        message.files.clone(),
+                                                    ),
                                                     SaveLocation::ChooseFolder,
                                                 );
-                                                ui.close();
                                             }
-                                            if ui.button("Save to Downloads").clicked() {
-                                                self.save_file(
-                                                    ctx,
-                                                    &key,
-                                                    &message.id,
-                                                    Download::Attachment(*index),
-                                                    file,
-                                                    SaveLocation::Downloads,
-                                                );
-                                                ui.close();
-                                            }
-                                        });
-                                    }
-                                    if message.files.len() > 1
-                                        && ui.button("Download all").clicked()
-                                    {
-                                        self.save_files(
-                                            ctx,
-                                            &key,
-                                            &message.id,
-                                            DownloadFiles::Attachments(message.files.clone()),
-                                            SaveLocation::ChooseFolder,
-                                        );
-                                    }
-                                    ui.menu_button("Message", |ui| {
-                                        self.body_view_options(ui, &key, &message.id);
-                                        if !is_draft {
-                                            if !self.demo && ui.button("Draft with Luna").clicked()
-                                            {
-                                                self.start_luna(Some(message));
-                                                ui.close();
-                                            }
-                                            for (text, reply) in
-                                                [("Reply", 0), ("Reply all", 1), ("Forward", 2)]
-                                            {
-                                                if ui.button(text).clicked() {
-                                                    self.reply_to(Some(message.clone()), reply);
+                                            ui.menu_button("Message", |ui| {
+                                                self.body_view_options(ui, &key, &message.id);
+                                                if !is_draft {
+                                                    if !self.demo
+                                                        && ui.button("Draft with Luna").clicked()
+                                                    {
+                                                        self.start_luna(Some(message));
+                                                        ui.close();
+                                                    }
+                                                    for (text, reply) in [
+                                                        ("Reply", 0),
+                                                        ("Reply all", 1),
+                                                        ("Forward", 2),
+                                                    ] {
+                                                        if ui.button(text).clicked() {
+                                                            self.reply_to(
+                                                                Some(message.clone()),
+                                                                reply,
+                                                            );
+                                                            ui.close();
+                                                        }
+                                                    }
+                                                }
+                                                if is_draft
+                                                    && message
+                                                        .labels
+                                                        .iter()
+                                                        .any(|tag| tag == "DRAFT")
+                                                    && ui.button("Copy to local draft").clicked()
+                                                {
+                                                    self.open_compose(Draft {
+                                                        account: key.account.clone(),
+                                                        to: message.recipients.clone(),
+                                                        cc: message.cc.clone(),
+                                                        bcc: message.bcc.clone(),
+                                                        subject: message.subject.clone(),
+                                                        body: message.body.clone(),
+                                                        files: cached_files(&key, message),
+                                                        ..Draft::default()
+                                                    });
                                                     ui.close();
                                                 }
-                                            }
-                                        }
-                                        if is_draft
-                                            && message.labels.iter().any(|tag| tag == "DRAFT")
-                                            && ui.button("Copy to local draft").clicked()
-                                        {
-                                            self.open_compose(Draft {
-                                                account: key.account.clone(),
-                                                to: message.recipients.clone(),
-                                                cc: message.cc.clone(),
-                                                bcc: message.bcc.clone(),
-                                                subject: message.subject.clone(),
-                                                body: message.body.clone(),
-                                                files: cached_files(&key, message),
-                                                ..Draft::default()
+                                                if ui.button("Save original (.eml)").clicked() {
+                                                    self.save_file(
+                                                        ctx,
+                                                        &key,
+                                                        &message.id,
+                                                        Download::Raw,
+                                                        &format!("{}.eml", message.id),
+                                                        SaveLocation::ChooseFolder,
+                                                    );
+                                                    ui.close();
+                                                }
+                                                if ui.button("Copy sender").clicked() {
+                                                    ctx.copy_text(message.sender.clone());
+                                                    ui.close();
+                                                }
                                             });
-                                            ui.close();
-                                        }
-                                        if ui.button("Save original (.eml)").clicked() {
-                                            self.save_file(
-                                                ctx,
-                                                &key,
-                                                &message.id,
-                                                Download::Raw,
-                                                &format!("{}.eml", message.id),
-                                                SaveLocation::ChooseFolder,
-                                            );
-                                            ui.close();
-                                        }
-                                        if ui.button("Copy sender").clicked() {
-                                            ctx.copy_text(message.sender.clone());
-                                            ui.close();
-                                        }
+                                        });
                                     });
-                                });
                             }
                         });
                     line(ui, t.line);
                 }
-                if !is_draft && !messages.is_empty() {
-                    Frame::new().inner_margin(Margin::same(15)).show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            if t.primary(ui, "Reply").on_hover_text("Reply (r)").clicked() {
-                                self.reply_to(None, 0);
-                            }
-                            if ui
-                                .button("Reply all")
-                                .on_hover_text("Reply all (a)")
-                                .clicked()
-                            {
-                                self.reply_to(None, 1);
-                            }
-                            if ui.button("Forward").on_hover_text("Forward (f)").clicked() {
-                                self.reply_to(None, 2);
-                            }
-                            if !self.demo
-                                && ui
-                                    .button("Draft with Luna")
-                                    .on_hover_text("Draft a reply with Luna (Shift+R)")
-                                    .clicked()
-                            {
-                                self.start_luna(None);
+                if self.inline_compose() {
+                    Frame::new()
+                        .inner_margin(Margin {
+                            left: 72,
+                            right: 24,
+                            top: 12,
+                            bottom: 24,
+                        })
+                        .show(ui, |ui| {
+                            let focus = self.draft_focus;
+                            let frame = Frame::new()
+                                .fill(t.surface)
+                                .stroke(Stroke::new(1., t.line))
+                                .corner_radius(14)
+                                .inner_margin(Margin::same(18))
+                                .show(ui, |ui| self.compose_editor(ui, ctx, true));
+                            if focus {
+                                frame.response.scroll_to_me(Some(Align::BOTTOM));
                             }
                         });
-                    });
+                } else if !is_draft && !messages.is_empty() {
+                    Frame::new()
+                        .inner_margin(Margin {
+                            left: 72,
+                            right: 24,
+                            top: 16,
+                            bottom: 24,
+                        })
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if t.primary(ui, "Reply").on_hover_text("Reply (r)").clicked() {
+                                    self.reply_to(None, 0);
+                                }
+                                if ui
+                                    .button("Reply all")
+                                    .on_hover_text("Reply all (a)")
+                                    .clicked()
+                                {
+                                    self.reply_to(None, 1);
+                                }
+                                if ui.button("Forward").on_hover_text("Forward (f)").clicked() {
+                                    self.reply_to(None, 2);
+                                }
+                                if !self.demo
+                                    && ui
+                                        .button("Draft with Luna")
+                                        .on_hover_text("Draft a reply with Luna (Shift+R)")
+                                        .clicked()
+                                {
+                                    self.start_luna(None);
+                                }
+                            });
+                        });
                 }
             });
     }

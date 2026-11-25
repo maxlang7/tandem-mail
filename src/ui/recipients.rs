@@ -72,6 +72,7 @@ impl RecipientEditor {
             ""
         };
         let mut edit = TextEdit::singleline(value)
+            .frame(false)
             .hint_text(hint)
             .id(id)
             .desired_width(f32::INFINITY)

@@ -1,4 +1,5 @@
 mod body;
+mod compose_editor;
 mod dialogs;
 mod fixtures;
 mod labels;
@@ -108,6 +109,7 @@ pub struct MailApp {
     expanded: HashSet<String>,
     draft: Option<Draft>,
     draft_focus: bool,
+    composer: compose_editor::Editor,
     recipients: recipients::RecipientEditor,
     luna: Option<luna_reply::LunaDialog>,
     modal: Option<Modal>,
@@ -118,6 +120,7 @@ pub struct MailApp {
     filter_view: Vec<Filter>,
     confirm_filter: Option<String>,
     modal_focus: bool,
+    recent_archives: HashMap<ThreadKey, Instant>,
     notify: Option<(String, bool, Instant)>,
     errors: Option<String>,
     dirty: bool,
@@ -192,6 +195,7 @@ impl MailApp {
             expanded: HashSet::new(),
             draft: None,
             draft_focus: false,
+            composer: compose_editor::Editor::default(),
             recipients: recipients::RecipientEditor::default(),
             luna: None,
             modal: None,
@@ -202,6 +206,7 @@ impl MailApp {
             filter_view: vec![],
             confirm_filter: None,
             modal_focus: false,
+            recent_archives: HashMap::new(),
             notify: None,
             errors: None,
             dirty: false,
@@ -503,7 +508,7 @@ impl MailApp {
                 return false;
             }
             match self.store.queue_mailbox_changes(&keys, &action) {
-                Ok(0) => self.toast(
+                Ok(queued) if queued.is_empty() => self.toast(
                     if action.inbox_override() == Some(false) {
                         "Already archived"
                     } else {
@@ -511,18 +516,18 @@ impl MailApp {
                     },
                     false,
                 ),
-                Ok(count) => {
-                    self.toast(
-                        if action.inbox_override() == Some(false) {
-                            format!(
-                                "Archive queued for {count} {}",
-                                if count == 1 { "thread" } else { "threads" }
-                            )
-                        } else {
-                            "Mailbox change queued".to_owned()
-                        },
-                        false,
-                    );
+                Ok(queued) => {
+                    if action.inbox_override() == Some(false) {
+                        let archived_at = Instant::now();
+                        for key in queued {
+                            self.recent_archives.insert(key, archived_at);
+                        }
+                    } else {
+                        for key in queued {
+                            self.recent_archives.remove(&key);
+                        }
+                        self.toast("Mailbox change queued", false);
+                    }
                     self.reload();
                     self.scroll_cursor = true;
                 }
@@ -783,6 +788,9 @@ impl MailApp {
     }
 
     fn keys(&mut self, ctx: &Context) {
+        if self.draft.is_some() && self.composer.editing_link() {
+            return;
+        }
         let key = |mods, target| {
             ctx.input_mut(|input| {
                 let mut hit = false;
@@ -826,7 +834,7 @@ impl MailApp {
         if key(Modifiers::COMMAND, Key::R) {
             self.refresh();
         }
-        if key(Modifiers::COMMAND, Key::K) && self.draft.is_none() {
+        if self.draft.is_none() && key(Modifiers::COMMAND, Key::K) {
             self.set_modal(Modal::Palette);
         }
         if key(Modifiers::NONE, Key::Escape) {
@@ -996,6 +1004,7 @@ impl MailApp {
         self.sidebar(ctx);
         self.footer(ctx);
         self.workspace(ctx);
+        self.archive_undo(ctx);
         self.compose(ctx);
         self.dialogs(ctx);
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -1070,6 +1079,57 @@ mod tests {
 
     use super::{MailApp, Modal, View, seed_demo};
     use crate::{model::Label, store::Store, sync::Command};
+
+    #[test]
+    fn compose_shortcuts_format_text_and_open_the_link_dialog() -> anyhow::Result<()> {
+        let path = std::path::PathBuf::from(":memory:");
+        let ctx = egui::Context::default();
+        let mut app = MailApp::new(
+            &ctx,
+            Store::open(&path)?,
+            path,
+            vec![],
+            tokio::runtime::Runtime::new()?,
+            true,
+        );
+        app.open_compose(crate::model::Draft {
+            to: "reader@example.com".into(),
+            body: "Read more".into(),
+            ..Default::default()
+        });
+        let run = |app: &mut MailApp, events| {
+            let _ = ctx.run(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1200., 900.))),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            );
+        };
+        let key = |key, modifiers| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        run(&mut app, vec![]);
+        run(&mut app, vec![key(Key::A, Modifiers::COMMAND)]);
+        run(&mut app, vec![key(Key::B, Modifiers::COMMAND)]);
+        assert!(app.draft.as_ref().unwrap().formatting[0].style.bold);
+        run(&mut app, vec![key(Key::K, Modifiers::COMMAND)]);
+        assert!(app.composer.editing_link());
+        run(&mut app, vec![Event::Text("https://example.com".into())]);
+        run(&mut app, vec![key(Key::Enter, Modifiers::NONE)]);
+        let draft = app.draft.as_ref().unwrap();
+        assert_eq!(draft.body, "Read more");
+        assert_eq!(
+            draft.formatting[0].style.link.as_deref(),
+            Some("https://example.com/")
+        );
+        Ok(())
+    }
 
     #[test]
     fn go_chords_navigate_and_refresh_from_the_inbox_list() -> anyhow::Result<()> {
@@ -1190,6 +1250,48 @@ mod tests {
         press(&mut app, Key::E, false);
         assert!(app.open.is_none());
         assert!(!app.rows.iter().any(|row| row.key == open));
+        Ok(())
+    }
+
+    #[test]
+    fn reply_editor_follows_the_thread_without_losing_the_draft() -> anyhow::Result<()> {
+        let path = std::path::PathBuf::from(":memory:");
+        let accounts = crate::model::accounts(std::path::Path::new("/tmp"), &path)?;
+        let mut store = Store::open(&path)?;
+        seed_demo(&mut store, &accounts)?;
+        let ctx = egui::Context::default();
+        let mut app = MailApp::new(
+            &ctx,
+            store,
+            path,
+            accounts,
+            tokio::runtime::Runtime::new()?,
+            true,
+        );
+        app.open = Some(app.rows[0].key.clone());
+        app.messages = app.store.thread(app.open.as_ref().unwrap())?;
+        app.reply_to(None, 0);
+        assert!(app.inline_compose());
+        app.draft.as_mut().unwrap().body = "Keep this reply".into();
+        let run = |app: &mut MailApp| {
+            ctx.run(
+                RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0., 0.), vec2(1320., 840.))),
+                    ..Default::default()
+                },
+                |ctx| app.frame(ctx),
+            )
+        };
+        let _ = run(&mut app);
+        assert!(!app.draft_focus);
+        let thread = app.open.take();
+        assert!(!app.inline_compose());
+        let _ = run(&mut app);
+        assert_eq!(app.draft.as_ref().unwrap().body, "Keep this reply");
+        app.open = thread;
+        assert!(app.inline_compose());
+        let _ = run(&mut app);
+        assert_eq!(app.draft.as_ref().unwrap().body, "Keep this reply");
         Ok(())
     }
 

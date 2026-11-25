@@ -12,7 +12,46 @@ use crate::{
 };
 
 impl MailApp {
+    pub(super) fn inline_compose(&self) -> bool {
+        self.draft
+            .as_ref()
+            .zip(self.open.as_ref())
+            .is_some_and(|(draft, key)| {
+                draft.account == key.account && draft.thread.as_ref() == Some(&key.thread)
+            })
+    }
+
     pub(super) fn compose(&mut self, ctx: &Context) {
+        if self.draft.is_none() || self.inline_compose() {
+            return;
+        }
+        let rect = ctx.content_rect();
+        let width = (rect.width() * 0.56)
+            .clamp(420., 780.)
+            .min(rect.width() - 24.);
+        let height = (rect.height() * 0.78)
+            .clamp(420., 720.)
+            .min(rect.height() - 32.);
+        let mut visible = true;
+        egui::Window::new("New message")
+            .id(egui::Id::new("composer-gmail"))
+            .collapsible(false)
+            .default_size([width, height])
+            .default_pos(rect.right_bottom() - vec2(width + 24., height + 32.))
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(self.theme.surface)
+                    .inner_margin(egui::Margin::same(16))
+                    .corner_radius(12),
+            )
+            .open(&mut visible)
+            .show(ctx, |ui| self.compose_editor(ui, ctx, false));
+        if !visible {
+            self.draft = None;
+        }
+    }
+
+    pub(super) fn compose_editor(&mut self, ui: &mut Ui, _ctx: &Context, inline: bool) {
         let Some(mut draft) = self.draft.take() else {
             return;
         };
@@ -24,130 +63,135 @@ impl MailApp {
         let mut queue = false;
         let mut schedule = false;
         let focus = std::mem::take(&mut self.draft_focus);
-        let width = (ctx.content_rect().width() * 0.47).clamp(400., 650.);
-        egui::Window::new(if draft.thread.is_some() {
-            "Reply"
-        } else {
-            "New message"
-        })
-        .id(egui::Id::new("composer"))
-        .collapsible(false)
-        .default_size([width, 395.])
-        .default_pos(ctx.content_rect().right_bottom() - vec2(width + 34., 450.))
-        .open(&mut visible)
-        .show(ctx, |ui| {
-            Grid::new("compose-fields")
-                .num_columns(2)
-                .spacing([12., 6.])
-                .show(ui, |ui| {
-                    ui.label(t.muted("From"));
-                    if draft.thread.is_some() {
-                        ui.label(
-                            self.account(&draft.account)
-                                .map(|a| a.email.as_str())
-                                .unwrap_or(""),
-                        );
-                    } else {
-                        let previous = draft.account.clone();
-                        account_selector(ui, "draft-account", &mut draft.account, &self.accounts);
-                        changed |= previous != draft.account;
-                    }
-                    ui.end_row();
-                    let account = self
-                        .accounts
-                        .iter()
-                        .find(|account| account.id == draft.account);
-                    let focus_to = focus && draft.to.is_empty();
-                    for (label, value, focus_field) in [
-                        ("To", &mut draft.to, focus_to),
-                        ("Cc", &mut draft.cc, false),
-                        ("Bcc", &mut draft.bcc, false),
-                    ] {
-                        ui.label(t.muted(label));
-                        changed |= self.recipients.field(
-                            ui,
-                            label,
-                            value,
-                            account,
-                            &self.store,
-                            focus_field,
-                        );
-                        ui.end_row();
-                    }
-                    ui.label(t.muted("Subject"));
-                    changed |= ui
-                        .add(TextEdit::singleline(&mut draft.subject).desired_width(f32::INFINITY))
-                        .changed();
-                    ui.end_row();
-                });
-            let body = ui.add_sized(
-                [
-                    ui.available_width(),
-                    (ui.available_height() - 70.).max(190.),
-                ],
-                TextEdit::multiline(&mut draft.body).hint_text("Write your message"),
-            );
-            if focus && !draft.to.is_empty() {
-                body.request_focus();
-            }
-            changed |= body.changed();
-            if !draft.files.is_empty() {
-                let mut remove = None;
-                ui.horizontal_wrapped(|ui| {
-                    for (i, file) in draft.files.iter().enumerate() {
-                        let name = &file.name;
-                        if ui
-                            .button(format!("{name}  ×"))
-                            .on_hover_text("Remove attachment")
-                            .clicked()
-                        {
-                            remove = Some(i);
-                        }
-                    }
-                });
-                if let Some(index) = remove {
-                    draft.files.remove(index);
-                    changed = true;
-                }
-            }
-            ui.horizontal_wrapped(|ui| {
-                if t.primary(ui, "Send")
-                    .on_hover_text("Send with a 10-second undo window (Ctrl+Enter)")
+        let extra_id = ui.make_persistent_id("extra-recipients");
+        let mut extra = ui.data(|data| data.get_temp::<bool>(extra_id).unwrap_or(false))
+            || !draft.cc.is_empty()
+            || !draft.bcc.is_empty();
+        ui.horizontal(|ui| {
+            ui.label(t.muted(if inline { "Reply" } else { "Message" }));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .small_button(if extra { "Hide Cc / Bcc" } else { "Cc / Bcc" })
                     .clicked()
                 {
-                    queue = true;
+                    extra = !extra;
+                    ui.data_mut(|data| data.insert_temp(extra_id, extra));
                 }
-                if ui.button("Schedule").clicked() {
-                    schedule = true;
+            });
+        });
+        Grid::new("compose-fields")
+            .num_columns(2)
+            .spacing([12., 6.])
+            .show(ui, |ui| {
+                ui.label(t.muted("From"));
+                if draft.thread.is_some() {
+                    ui.label(
+                        self.account(&draft.account)
+                            .map(|a| a.email.as_str())
+                            .unwrap_or(""),
+                    );
+                } else {
+                    let previous = draft.account.clone();
+                    account_selector(ui, "draft-account", &mut draft.account, &self.accounts);
+                    changed |= previous != draft.account;
                 }
-                if ui.button("Attach").clicked()
-                    && let Some(files) = rfd::FileDialog::new().pick_files()
-                {
-                    for file in files {
-                        match self.store.stage_file(&file) {
-                            Ok(file) => {
-                                draft.files.push(file);
-                                changed = true;
-                            }
-                            Err(error) => self.toast(error.to_string(), true),
-                        }
+                ui.end_row();
+                let account = self
+                    .accounts
+                    .iter()
+                    .find(|account| account.id == draft.account);
+                let focus_to = focus && draft.to.is_empty();
+                for (label, value, focus_field) in [
+                    ("To", &mut draft.to, focus_to),
+                    ("Cc", &mut draft.cc, false),
+                    ("Bcc", &mut draft.bcc, false),
+                ] {
+                    if label != "To" && !extra {
+                        continue;
                     }
+                    ui.label(t.muted(label));
+                    changed |=
+                        self.recipients
+                            .field(ui, label, value, account, &self.store, focus_field);
+                    ui.end_row();
                 }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Discard").clicked() {
-                        discard = true;
-                    }
+                ui.label(t.muted("Subject"));
+                changed |= ui
+                    .add(
+                        TextEdit::singleline(&mut draft.subject)
+                            .frame(false)
+                            .desired_width(f32::INFINITY),
+                    )
+                    .changed();
+                ui.end_row();
+            });
+        ui.separator();
+        ui.add_space(8.);
+        let body_height = if inline {
+            260.
+        } else {
+            (ui.available_height() - 114.).max(160.)
+        };
+        let focus_body = focus && !draft.to.is_empty();
+        changed |= self
+            .composer
+            .show(ui, &mut draft, t, body_height, focus, focus_body);
+        if !draft.files.is_empty() {
+            let mut remove = None;
+            ui.horizontal_wrapped(|ui| {
+                for (i, file) in draft.files.iter().enumerate() {
+                    let name = &file.name;
                     if ui
-                        .button("Close")
-                        .on_hover_text("Keep the draft locally")
+                        .button(format!("{name}  ×"))
+                        .on_hover_text("Remove attachment")
                         .clicked()
                     {
-                        close = true;
+                        remove = Some(i);
                     }
-                    if draft.id != 0 {
-                        ui.label(t.muted("Local draft").size(12.));
+                }
+            });
+            if let Some(index) = remove {
+                draft.files.remove(index);
+                changed = true;
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            if t.primary(ui, "Send")
+                .on_hover_text("Send with a 10-second undo window (Ctrl+Enter)")
+                .clicked()
+            {
+                queue = true;
+            }
+            if ui.button("Schedule").clicked() {
+                schedule = true;
+            }
+            if ui.button("Attach").clicked()
+                && let Some(files) = rfd::FileDialog::new().pick_files()
+            {
+                for file in files {
+                    match self.store.stage_file(&file) {
+                        Ok(file) => {
+                            draft.files.push(file);
+                            changed = true;
+                        }
+                        Err(error) => self.toast(error.to_string(), true),
                     }
-                });
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Discard").clicked() {
+                    discard = true;
+                }
+                if ui
+                    .button("Close")
+                    .on_hover_text("Keep the draft locally")
+                    .clicked()
+                {
+                    close = true;
+                }
+                if draft.id != 0 {
+                    ui.label(t.muted("Local draft").size(12.));
+                }
             });
         });
         if discard {

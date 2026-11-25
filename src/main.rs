@@ -1,3 +1,4 @@
+mod compose_format;
 mod gmail;
 mod html_mail;
 mod luna;

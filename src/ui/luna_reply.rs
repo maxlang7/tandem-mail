@@ -206,6 +206,7 @@ impl MailApp {
         if use_reply {
             let mut draft = mime::reply(&state.target, &state.account, &state.key.thread, false);
             draft.body = reply.text.clone();
+            draft.formatting.clear();
             self.modal = None;
             self.luna = None;
             self.open_compose(draft);

@@ -458,7 +458,11 @@ impl Store {
             .unwrap_or_default())
     }
 
-    pub fn queue_mailbox_changes(&mut self, keys: &[ThreadKey], action: &Action) -> Result<usize> {
+    pub fn queue_mailbox_changes(
+        &mut self,
+        keys: &[ThreadKey],
+        action: &Action,
+    ) -> Result<Vec<ThreadKey>> {
         let tx = self
             .0
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -473,12 +477,14 @@ impl Store {
               AND {IN_INBOX} <> ?4
             )"
         );
-        let mut count = 0;
+        let mut queued = Vec::new();
         for key in keys {
-            count += tx.execute(&sql, params![key.account, key.thread, serialized, inbox])?;
+            if tx.execute(&sql, params![key.account, key.thread, serialized, inbox])? != 0 {
+                queued.push(key.clone());
+            }
         }
         tx.commit()?;
-        Ok(count)
+        Ok(queued)
     }
 
     pub fn next_mailbox_change(&self, account: &str) -> Result<Option<MailboxChange>> {
