@@ -1,26 +1,53 @@
 # Tandem Mail
 
-Tandem Mail is a native Rust desktop client for Gmail. Personal and CMU mail can
-share an inbox or be browsed separately. The account menu in the header
-also scopes search, folders, and saved searches. The app opens in Gruvbox dark by
-default. Settings also offers Gruvbox light.
+Keyboard-first Gmail on the Linux desktop. Built with Rust and egui, with a local SQLite mailbox and Gruvbox light and dark themes.
 
-## Run on NixOS
+![Tandem Mail unified inbox in Gruvbox dark](assets/screenshots/inbox.png)
 
-On Aragorn, open Rofi with Super+Space and search for **Tandem Mail**. Rofi
-uses the prepared release build and loads the mailbox in the background.
-After editing the source, update that build from this directory with
-`nix-shell --run './scripts/launch.sh --prepare'`.
+Browse multiple Gmail accounts together, search downloaded mail offline, and reply without leaving the thread. Tandem keeps mail and attachments locally while Gmail handles delivery and server-side filters.
+
+## What it does
+
+- Unified inbox with account-specific folders, labels, saved searches, and bulk actions.
+- Offline full-text search with Gmail-style operators, plus live Gmail search.
+- Rich-text replies with bold, italics, underline, and custom links. Drafts and attachments autosave locally.
+- Ten-second send undo, local scheduling and snooze, and keyboard navigation throughout.
+- Native reading for everyday mail and an isolated Brave renderer for designed HTML messages.
+- Optional AI reply drafting through a signed-in Codex CLI, with a chance to review every reply.
+- A local MCP server for searching and reading cached mail. Sending requires an explicit flag.
+
+![Reading a message and composing an inline reply](assets/screenshots/reply.png)
+
+Screenshots use the disposable sample mailbox, with fictional messages.
+
+## Try it
+
+Tandem is an early desktop project developed on NixOS and Wayland. Account setup currently requires existing Google OAuth credentials; there is no built-in sign-in flow or packaged download.
+
+With Nix installed:
 
 ```sh
-cd ~/Projects/tandem-mail
-nix-shell --run 'cargo run --locked'
+git clone https://github.com/maxlang7/tandem-mail.git
+cd tandem-mail
+nix-shell --run 'cargo run --locked -j 3 -- --demo'
 ```
 
-For a disposable sample mailbox, use
-`nix-shell --run 'cargo run --locked -- --demo'`. To test account access without
-starting the cache or changing mail, use
-`nix-shell --run 'cargo run --locked -- --check-accounts'`.
+The demo uses an in-memory mailbox and does not connect to Gmail. To use real mail, configure accounts below, then run:
+
+```sh
+nix-shell --run 'cargo run --locked -j 3'
+```
+
+The shell supplies Rust, build tools, graphics libraries, and a bold font. HTML mail rendering also needs Brave available on `PATH`. Other Linux distributions need the equivalent Wayland or X11, OpenGL, D-Bus, and keyboard libraries. Platforms other than Linux are untested.
+
+To prepare the local release launcher:
+
+```sh
+nix-shell --run 'CARGO_BUILD_JOBS=3 ./scripts/launch.sh --prepare'
+./scripts/launch.sh
+```
+
+Use `--check-accounts` to verify account access without starting mailbox sync.
 
 ### Account setup
 
@@ -70,7 +97,7 @@ actions and sending, and Gmail settings access for server-side filters.
   filenames via query syntax, attachments, and size. Actions include labeling,
   skipping the inbox, marking read, starring, spam handling,
   categorizing, and forwarding to an address already verified in Gmail.
-- Compose, forward, reply, or reply all with attachments. Drafts and their file
+- Compose, forward, reply, or reply all with attachments and rich-text formatting. Use Ctrl+B, Ctrl+I, and Ctrl+U for bold, italics, and underline, or Ctrl+K to insert a link with custom text. Drafts and their file
   bytes autosave locally. Gmail drafts are readable and can be copied into a
   local draft. Send queues a message with ten seconds to undo it. Schedule and
   snooze are local to Tandem Mail. Scheduled messages send when due while
@@ -209,5 +236,5 @@ angle brackets. [Gmail search operators](https://support.google.com/mail/answer/
 ## Development checks
 
 ```sh
-nix-shell --run 'cargo fmt --check && cargo test --locked && cargo clippy --locked --all-targets -- -D warnings'
+nix-shell --run 'cargo fmt --check && cargo test --locked -j 3 && cargo clippy --locked -j 3 --all-targets -- -D warnings'
 ```
