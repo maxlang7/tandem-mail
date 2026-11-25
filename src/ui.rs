@@ -26,7 +26,7 @@ use crate::{
     sync::{self, Command, Commands, Event, Status},
 };
 pub use fixtures::seed_demo;
-use theme::Theme;
+pub(crate) use theme::Theme;
 
 const PAGE: usize = 80;
 
@@ -356,6 +356,18 @@ impl MailApp {
         }
         if self.modal == Some(Modal::Filters) {
             self.filter_view = self.store.filters(&self.modal_account).unwrap_or_default();
+        }
+        if !self.demo {
+            let accounts: Vec<_> = self
+                .accounts
+                .iter()
+                .map(|account| account.id.as_str())
+                .collect();
+            if let Ok(inbox) = self.store.inbox_reader_keys(&accounts) {
+                self.reader_content.set_inbox(inbox);
+            } else {
+                self.reader_content.suspend_warming();
+            }
         }
         self.loaded_at = Instant::now();
         self.dirty = false;
@@ -993,6 +1005,11 @@ impl MailApp {
 }
 
 impl MailApp {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn reader_is_covered(&self) -> bool {
+        self.modal.is_some() || (self.draft.is_some() && !self.inline_compose())
+    }
+
     fn frame(&mut self, ctx: &Context) {
         self.process_events(ctx);
         self.keys(ctx);
@@ -1004,6 +1021,9 @@ impl MailApp {
         self.sidebar(ctx);
         self.footer(ctx);
         self.workspace(ctx);
+        if !self.demo {
+            self.reader_content.warm(ctx, &self.runtime, &self.path);
+        }
         self.archive_undo(ctx);
         self.compose(ctx);
         self.dialogs(ctx);

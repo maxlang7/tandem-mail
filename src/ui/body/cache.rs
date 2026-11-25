@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    cmp::Reverse,
+    collections::{HashSet, VecDeque},
+    path::PathBuf,
+};
 
 use super::*;
 
@@ -9,27 +13,13 @@ const WARM_IMAGE_BYTES: usize = 40 * 1024 * 1024;
 
 pub(in crate::ui) type MessageKey = (String, String);
 
-#[derive(Clone, Copy)]
-pub(in crate::ui) struct RenderSize {
-    pub width: u32,
-    pub density: u32,
-}
-
-impl RenderSize {
-    pub fn new(ctx: &egui::Context, width: f32) -> Self {
-        Self {
-            width: (width.clamp(200., 1800.) as u32 / 8) * 8,
-            density: ctx.pixels_per_point().ceil().clamp(1., 2.) as u32,
-        }
-    }
-}
-
 #[derive(Default)]
 pub(in crate::ui) struct ReaderContent {
     messages: HashMap<MessageKey, Entry>,
     warming: Option<MessageKey>,
     attempted: HashSet<MessageKey>,
-    start_after: Option<Instant>,
+    inbox: HashMap<MessageKey, usize>,
+    pending: VecDeque<MessageKey>,
 }
 
 struct Entry {
@@ -74,7 +64,17 @@ impl ReaderContent {
                 .messages
                 .iter()
                 .filter(|(_, entry)| !matches!(entry.state, State::Loading(_)))
-                .min_by_key(|(_, entry)| entry.last_opened)
+                .max_by_key(|(key, entry)| {
+                    (
+                        entry.speculative,
+                        if entry.speculative {
+                            self.inbox.get(*key).copied().unwrap_or(0)
+                        } else {
+                            0
+                        },
+                        Reverse(entry.last_opened),
+                    )
+                })
                 .filter(|_| self.messages.len() > 1)
                 .map(|(key, _)| key.clone())
             else {
@@ -84,34 +84,37 @@ impl ReaderContent {
         }
     }
 
-    pub fn warm(
-        &mut self,
-        ctx: &egui::Context,
-        runtime: &tokio::runtime::Runtime,
-        path: &Path,
-        candidates: &[MessageKey],
-        size: RenderSize,
-    ) {
-        if candidates.is_empty() {
-            self.cancel_warm();
-            self.attempted.clear();
-            return;
-        }
-        let start_after = *self
-            .start_after
-            .get_or_insert_with(|| Instant::now() + Duration::from_millis(200));
-        if let Some(delay) = start_after.checked_duration_since(Instant::now()) {
-            ctx.request_repaint_after(delay);
-            return;
-        }
-        self.attempted.retain(|key| candidates.contains(key));
+    pub fn set_inbox(&mut self, keys: Vec<MessageKey>) {
+        let inbox: HashMap<_, _> = keys
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(rank, key)| (key, rank))
+            .collect();
+        self.messages.retain(|key, entry| {
+            inbox.contains_key(key) || (!entry.speculative && !self.inbox.contains_key(key))
+        });
+        self.inbox = inbox;
         if self
             .warming
             .as_ref()
-            .is_some_and(|key| !candidates.contains(key))
+            .is_some_and(|key| !self.inbox.contains_key(key))
         {
             self.cancel_warm();
         }
+        self.attempted.retain(|key| self.inbox.contains_key(key));
+        self.pending = keys
+            .into_iter()
+            .filter(|key| !self.attempted.contains(key))
+            .collect();
+    }
+
+    pub fn suspend_warming(&mut self) {
+        self.cancel_warm();
+        self.pending.clear();
+    }
+
+    pub fn warm(&mut self, ctx: &egui::Context, runtime: &tokio::runtime::Runtime, path: &Path) {
         if self
             .messages
             .values()
@@ -119,13 +122,12 @@ impl ReaderContent {
         {
             return;
         }
-        if let Some(key) = candidates
-            .iter()
-            .find(|key| !self.messages.contains_key(*key) && !self.attempted.contains(*key))
-        {
-            self.attempted.insert(key.clone());
-            self.warming = Some(key.clone());
-            self.start(ctx, runtime, path, key, size);
+        while let Some(key) = self.pending.pop_front() {
+            if self.attempted.insert(key.clone()) && !self.messages.contains_key(&key) {
+                self.warming = Some(key.clone());
+                self.start(ctx, runtime, path, &key);
+                return;
+            }
         }
     }
 
@@ -139,18 +141,15 @@ impl ReaderContent {
         if self
             .messages
             .get(key)
-            .is_none_or(|entry| entry.speculative && matches!(entry.state, State::Unavailable))
+            .is_none_or(|entry| entry.speculative && !matches!(entry.state, State::Ready(_)))
         {
             self.cancel_warm();
-            self.start(
-                ui.ctx(),
-                runtime,
-                path,
-                key,
-                RenderSize::new(ui.ctx(), ui.available_width()),
-            );
-        } else if self.warming.as_ref() == Some(key) {
-            self.warming = None;
+            self.start(ui.ctx(), runtime, path, key);
+        }
+        if let Some(entry) = self.messages.get_mut(key)
+            && matches!(entry.state, State::Ready(_))
+        {
+            entry.speculative = false;
         }
         self.get_mut(key)
     }
@@ -189,6 +188,9 @@ impl ReaderContent {
         if let Some(key) = self.warming.take() {
             self.messages.remove(&key);
             self.attempted.remove(&key);
+            if self.inbox.contains_key(&key) {
+                self.pending.push_front(key);
+            }
         }
     }
 
@@ -198,15 +200,15 @@ impl ReaderContent {
         runtime: &tokio::runtime::Runtime,
         path: &Path,
         key: &MessageKey,
-        size: RenderSize,
     ) {
         let speculative = self.warming.as_ref() == Some(key);
         let (mut send, recv) = oneshot::channel();
         let (ctx, path, key_for_job) = (ctx.clone(), path.to_owned(), key.clone());
         runtime.spawn(async move {
             let result = tokio::select! {
+                biased;
                 _ = send.closed() => return,
-                result = prepare_reader(&ctx, path, key_for_job, size, speculative) => result,
+                result = prepare_reader(&ctx, path, key_for_job, speculative) => result,
             };
             let _ = send.send(result.ok().map(Box::new));
             ctx.request_repaint();
@@ -250,17 +252,11 @@ impl Entry {
                 _ => None,
             })
             .sum();
-        let html = reader.html.page.as_ref().map_or(0, |page| {
-            page.tiles
-                .iter()
-                .map(|tile| tile.size().into_iter().product::<usize>() * 4)
-                .sum::<usize>()
-                + page
-                    .gifs
-                    .iter()
-                    .map(|(_, image)| image.decoded.bytes())
-                    .sum::<usize>()
-        });
+        let html = reader
+            .html
+            .document
+            .as_ref()
+            .map_or(0, |doc| doc.html.len());
         let attachments: usize = reader
             .attachments
             .iter()
@@ -278,6 +274,11 @@ fn reader_message(store: &Store, key: &MessageKey, raw: Vec<u8>, plain: &str) ->
         BodyView::Auto
     };
     let attachments = attached_images(&raw);
+    let document = body
+        .layout
+        .is_some()
+        .then(|| cached_document(store, &raw))
+        .flatten();
     ReaderMessage {
         attachments,
         attachment_images: HashMap::new(),
@@ -285,7 +286,10 @@ fn reader_message(store: &Store, key: &MessageKey, raw: Vec<u8>, plain: &str) ->
         body,
         view,
         images: HashMap::new(),
-        html: HtmlReader::default(),
+        html: HtmlReader {
+            document: document.map(Arc::new),
+            ..HtmlReader::default()
+        },
     }
 }
 
@@ -312,7 +316,6 @@ async fn prepare_reader(
     ctx: &egui::Context,
     path: PathBuf,
     key: MessageKey,
-    size: RenderSize,
     speculative: bool,
 ) -> Result<ReaderMessage> {
     let (source_path, source_key) = (path.clone(), key.clone());
@@ -328,24 +331,16 @@ async fn prepare_reader(
         Ok::<_, anyhow::Error>(reader_message(&store, &source_key, raw, &plain))
     })
     .await??;
-    if reader.uses_original_html()
-        && let Some(raw) = &reader.raw
-    {
-        match PaintedPage::prepare(ctx, path.clone(), raw.clone(), size, false, &key.1).await {
-            Ok(Some(page)) => {
-                reader.html.page = Some(page);
-                reader.html.width = size.width;
-                reader.html.density = size.density;
-                return Ok(reader);
-            }
-            Ok(None) => reader.html.stopped = true,
-            Err(error) => {
-                eprintln!("HTML reader: {error}");
-                reader.html.stopped = true;
-            }
-        }
-    }
     if !speculative {
+        return Ok(reader);
+    }
+    if reader.uses_original_html() {
+        if let (Some(raw), Some(document)) = (&reader.raw, &reader.html.document)
+            && fetch_html_images(&path, document, Duration::from_millis(1200), WARM_IMAGES).await
+        {
+            let store = Store::open_read_only(&path)?;
+            reader.html.document = cached_document(&store, raw).map(Arc::new);
+        }
         return Ok(reader);
     }
     let sources: Vec<_> = reader
@@ -413,8 +408,67 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local Brave browser"]
-    fn visible_html_and_inline_image_are_ready_before_opening() -> Result<()> {
+    fn inbox_preload_cancels_on_archive_and_resumes_on_undo() -> Result<()> {
+        use crate::model::Action;
+
+        let mut store = Store::open(Path::new(":memory:"))?;
+        let raw = URL_SAFE_NO_PAD.encode("Subject: Test\r\n\r\nInbox item");
+        for account in ["home", "cmu"] {
+            let messages = (0..20)
+                .map(|i| RemoteMessage {
+                    id: format!("msg{i}"),
+                    thread_id: format!("thread{i}"),
+                    label_ids: vec!["INBOX".into()],
+                    internal_date: i.to_string(),
+                    raw: Some(raw.clone()),
+                })
+                .collect();
+            store.apply_messages(account, 1, messages, &[])?;
+        }
+        let accounts = ["home", "cmu"];
+        let mut cache = ReaderContent::default();
+        cache.set_inbox(store.inbox_reader_keys(&accounts)?);
+        assert_eq!(cache.pending.len(), 40);
+
+        let key = ("home".to_owned(), "msg19".to_owned());
+        let thread = ThreadKey {
+            account: key.0.clone(),
+            thread: "thread19".into(),
+        };
+        let (send, recv) = oneshot::channel();
+        cache.warming = Some(key.clone());
+        cache.attempted.insert(key.clone());
+        cache.messages.insert(
+            key.clone(),
+            Entry {
+                state: State::Loading(recv),
+                last_opened: Instant::now(),
+                speculative: true,
+            },
+        );
+
+        store.queue_mailbox_changes(
+            std::slice::from_ref(&thread),
+            &Action::labels(&[], &["INBOX"]),
+        )?;
+        cache.set_inbox(store.inbox_reader_keys(&accounts)?);
+        assert!(send.is_closed());
+        assert!(cache.warming.is_none());
+        assert_eq!(cache.pending.len(), 39);
+        assert!(!cache.messages.contains_key(&key));
+        assert!(store.reader_source(&key.0, &key.1, Some(4096))?.is_none());
+        assert!(store.reader_source(&key.0, &key.1, None)?.is_some());
+        assert!(cache.pending.contains(&("cmu".into(), key.1.clone())));
+
+        store.queue_mailbox_changes(&[thread], &Action::labels(&["INBOX"], &[]))?;
+        cache.set_inbox(store.inbox_reader_keys(&accounts)?);
+        assert_eq!(cache.pending.len(), 40);
+        assert!(cache.pending.contains(&key));
+        Ok(())
+    }
+
+    #[test]
+    fn sanitized_html_and_inline_image_are_ready_before_opening() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("mail.sqlite");
         let mut store = Store::open(&path)?;
@@ -427,7 +481,6 @@ mod tests {
              <table style=\"width:420px;background-color:#4c2584\"><tr><td>\
              <a href=\"https://example.invalid/post\">Open post</a>\
              <img src=\"data:image/png;base64,{encoded}\">\
-             <img src=\"https://example.invalid/external.png\">\
              </td></tr></table>"
         );
         store.apply_messages(
@@ -446,47 +499,35 @@ mod tests {
         let ctx = egui::Context::default();
         let runtime = tokio::runtime::Runtime::new()?;
         let key = ("home".to_owned(), "msg1".to_owned());
-        let size = RenderSize::new(&ctx, 600.);
-        let mut cache = ReaderContent {
-            start_after: Some(Instant::now()),
-            ..ReaderContent::default()
-        };
-        cache.warm(&ctx, &runtime, &path, std::slice::from_ref(&key), size);
+        let mut cache = ReaderContent::default();
+        cache.set_inbox(store.inbox_reader_keys(&["home"])?);
+        cache.warm(&ctx, &runtime, &path);
         let deadline = Instant::now() + Duration::from_secs(15);
-        let tile = loop {
+        let document = loop {
             cache.poll(None, &HashSet::new());
             if let Some(reader) = cache.get_mut(&key) {
-                let page = reader
+                let document = reader
                     .html
-                    .page
+                    .document
                     .as_ref()
-                    .context("HTML page was not prepared")?;
-                assert_eq!(page.links.len(), 1);
-                assert!(page.missing_images);
-                break page.tiles[0].id();
+                    .context("Missing HTML document")?;
+                assert!(document.html.contains("https://example.invalid/post"));
+                assert!(document.html.contains("data:image/png;base64,"));
+                assert!(document.missing.is_empty());
+                break document.clone();
             }
             ensure!(Instant::now() < deadline, "Reader cache timed out");
             std::thread::sleep(Duration::from_millis(15));
         };
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let opened = cache.open(ui, &runtime, &path, &key).unwrap();
-                assert_eq!(opened.html.page.as_ref().unwrap().tiles[0].id(), tile);
+                assert!(Arc::ptr_eq(
+                    opened.html.document.as_ref().unwrap(),
+                    &document
+                ));
             });
         });
-        assert!(output.textures_delta.set.iter().any(|(id, delta)| {
-            *id == tile
-                && match &delta.image {
-                    ImageData::Color(pixels) => pixels
-                        .pixels
-                        .contains(&egui::Color32::from_rgb(39, 181, 96)),
-                }
-        }));
-        assert!(
-            store
-                .remote_image("https://example.invalid/external.png")?
-                .is_none()
-        );
         Ok(())
     }
 }

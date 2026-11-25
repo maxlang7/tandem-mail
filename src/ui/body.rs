@@ -28,7 +28,7 @@ use crate::{
 };
 
 mod cache;
-pub(super) use cache::{ReaderContent, RenderSize};
+pub(super) use cache::ReaderContent;
 
 struct ReaderMessage {
     body: Body,
@@ -52,244 +52,85 @@ impl ReaderMessage {
 
 #[derive(Default)]
 struct HtmlReader {
-    page: Option<PaintedPage>,
-    pending: Option<HtmlJob>,
-    width: u32,
-    density: u32,
+    document: Option<Arc<html_mail::Document>>,
+    pending: Option<oneshot::Receiver<Result<html_mail::Document, String>>>,
     stopped: bool,
-    attempted_full_load: bool,
-    retry_images: bool,
-}
-
-type HtmlJob = oneshot::Receiver<Result<Option<PaintedPage>, String>>;
-
-struct PaintedPage {
-    size: egui::Vec2,
-    density: f32,
-    tiles: Vec<TextureHandle>,
-    links: Vec<html_mail::Link>,
-    gifs: Vec<(html_mail::Bounds, AnimatedImage)>,
-    missing_images: bool,
+    attempted_images: bool,
+    original_colors: bool,
 }
 
 impl HtmlReader {
-    fn show(
+    fn update_images(
         &mut self,
-        ui: &mut Ui,
+        ctx: &egui::Context,
         runtime: &tokio::runtime::Runtime,
-        cache: &Path,
+        path: &Path,
         raw: &Arc<[u8]>,
-        message: &str,
-    ) -> Option<Option<Url>> {
+        retry: bool,
+    ) {
         if let Some(pending) = &mut self.pending {
             match pending.try_recv() {
-                Ok(Ok(Some(page))) => {
-                    self.page = Some(page);
-                    self.pending = None;
-                }
-                Ok(Ok(None)) => {
-                    self.stopped = true;
-                    self.pending = None;
-                }
-                Ok(Err(error)) => {
-                    eprintln!("HTML reader: {error}");
-                    self.stopped = true;
-                    self.pending = None;
-                }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    self.stopped = true;
-                    self.pending = None;
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {}
+                Ok(Ok(document)) => self.document = Some(Arc::new(document)),
+                Ok(Err(error)) => eprintln!("HTML images: {error}"),
+                Err(oneshot::error::TryRecvError::Closed) => {}
+                Err(oneshot::error::TryRecvError::Empty) => return,
             }
+            self.pending = None;
         }
-
-        let RenderSize { width, density } = RenderSize::new(ui.ctx(), ui.available_width());
-        let load_images = self.retry_images
-            || (!self.attempted_full_load
-                && self.page.as_ref().is_some_and(|page| page.missing_images));
-        if !self.stopped
-            && self.pending.is_none()
-            && (self.width.abs_diff(width) >= 16 || self.density != density || load_images)
+        if self
+            .document
+            .as_ref()
+            .is_none_or(|document| document.missing.is_empty())
+            || (self.attempted_images && !retry)
         {
-            let (mut send, recv) = oneshot::channel();
-            let (ctx, cache, raw) = (ui.ctx().clone(), cache.to_owned(), raw.clone());
-            let message = message.to_owned();
-            self.retry_images = false;
-            self.attempted_full_load |= load_images;
-            self.pending = Some(recv);
-            self.width = width;
-            self.density = density;
-            runtime.spawn(async move {
-                let result = tokio::select! {
-                    _ = send.closed() => return,
-                    result = PaintedPage::prepare(&ctx, cache, raw, RenderSize { width, density }, load_images, &message) => result,
-                };
-                let _ = send.send(result.map_err(|err| format!("{err:#}")));
-                ctx.request_repaint();
-            });
+            return;
         }
-
-        let page = self.page.as_mut()?;
-        let clicked = page.draw(ui, message);
-        if page.missing_images
-            && self.pending.is_none()
-            && self.attempted_full_load
-            && !self.stopped
-            && ui.small_button("Retry missing images").clicked()
-        {
-            self.retry_images = true;
-            ui.ctx().request_repaint();
-        }
-        Some(clicked)
+        self.attempted_images = true;
+        let (mut send, recv) = oneshot::channel();
+        let (ctx, path, raw) = (ctx.clone(), path.to_owned(), raw.clone());
+        self.pending = Some(recv);
+        runtime.spawn(async move {
+            let result = tokio::select! {
+                _ = send.closed() => return,
+                result = load_html_images(path, raw) => result,
+            };
+            let _ = send.send(result.map_err(|error| format!("{error:#}")));
+            ctx.request_repaint();
+        });
     }
 }
 
-impl PaintedPage {
-    async fn prepare(
-        ctx: &egui::Context,
-        cache: PathBuf,
-        raw: Arc<[u8]>,
-        size: RenderSize,
-        load_images: bool,
-        message: &str,
-    ) -> Result<Option<Self>> {
-        let Some(page) = prepare_html(cache, raw, size.width, size.density, load_images).await?
-        else {
-            return Ok(None);
-        };
-        let tiles = page
-            .tiles
-            .into_iter()
-            .enumerate()
-            .map(|(index, tile)| {
-                ctx.load_texture(
-                    format!("html-mail:{message}:{index}"),
-                    ImageData::Color(color_image(tile)),
-                    TextureOptions::LINEAR,
-                )
-            })
-            .collect();
-        let gifs = stream::iter(page.animated.into_iter().enumerate())
-            .map(|(index, (bounds, bytes))| async move {
-                let pixels = decode_image(bytes).await.ok()?;
-                let image = AnimatedImage::new(ctx, format!("html-gif:{message}:{index}"), pixels);
-                Some((bounds, image))
-            })
-            .buffered(2)
-            .filter_map(std::future::ready)
-            .collect()
-            .await;
-        Ok(Some(Self {
-            size: egui::vec2(page.width as f32, page.height as f32),
-            density: page.density as f32,
-            tiles,
-            links: page.links,
-            gifs,
-            missing_images: !page.missing.is_empty(),
-        }))
-    }
-
-    fn draw(&mut self, ui: &mut Ui, message: &str) -> Option<Url> {
-        let scale = (ui.available_width() / self.size.x).min(1.);
-        let (rect, _) = ui.allocate_exact_size(self.size * scale, Sense::hover());
-        let painter = ui.painter();
-        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.));
-        let mut top = rect.top();
-        for tile in &self.tiles {
-            let tile_rect = egui::Rect::from_min_size(
-                egui::pos2(rect.left(), top),
-                tile.size_vec2() * (scale / self.density),
-            );
-            if ui.is_rect_visible(tile_rect) {
-                painter.image(tile.id(), tile_rect, uv, egui::Color32::WHITE);
-            }
-            top = tile_rect.bottom();
-        }
-
-        let place = |bounds: html_mail::Bounds| {
-            egui::Rect::from_min_size(
-                rect.min + egui::vec2(bounds.x, bounds.y) * scale,
-                egui::vec2(bounds.width, bounds.height) * scale,
-            )
-        };
-        for (bounds, image) in &mut self.gifs {
-            let image_rect = place(*bounds);
-            if ui.is_rect_visible(image_rect) {
-                painter.with_clip_rect(rect).image(
-                    image.texture(ui.ctx()).id(),
-                    image_rect,
-                    uv,
-                    egui::Color32::WHITE,
-                );
-            }
-        }
-
-        self.links.iter().enumerate().find_map(|(index, link)| {
-            let hit = place(link.bounds).intersect(rect);
-            if !ui.is_rect_visible(hit) || !hit.is_positive() {
-                return None;
-            }
-            let url = message_body::web_url(&link.url)?;
-            ui.interact(
-                hit,
-                ui.id().with(("html-link", message, index)),
-                Sense::click(),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text(url.as_str())
-            .clicked()
-            .then_some(url)
-        })
-    }
-}
-
-async fn prepare_html(
-    cache: PathBuf,
-    raw: Arc<[u8]>,
-    width: u32,
-    density: u32,
-    load_images: bool,
-) -> Result<Option<html_mail::Page>> {
+async fn load_html_images(cache: PathBuf, raw: Arc<[u8]>) -> Result<html_mail::Document> {
     let store = Store::open_read_only(&cache)?;
-    let Some(mut document) = cached_document(&store, &raw) else {
-        return Ok(None);
-    };
-    let urls: Vec<_> = document
-        .missing
-        .iter()
-        .take(if load_images { usize::MAX } else { 24 })
-        .cloned()
-        .collect();
-    if !urls.is_empty() {
-        let mut downloads = stream::iter(urls)
-            .map(|url| {
-                let cache = &cache;
-                async move { remote_image::load(cache, &url).await.is_ok() }
-            })
-            .buffer_unordered(4);
-        let budget = if load_images {
-            Duration::from_secs(10)
-        } else {
-            Duration::from_millis(1200)
-        };
-        let deadline = tokio::time::Instant::now() + budget;
-        let mut changed = false;
-        while let Ok(Some(result)) = tokio::time::timeout_at(deadline, downloads.next()).await {
-            changed |= result;
-        }
-        if changed {
-            document = cached_document(&store, &raw).context("Missing HTML body")?;
-        }
+    let document = cached_document(&store, &raw).context("Missing HTML body")?;
+    if fetch_html_images(&cache, &document, Duration::from_secs(10), usize::MAX).await {
+        return cached_document(&store, &raw).context("Missing HTML body");
     }
-    html_mail::render_cached(
-        document,
-        width,
-        density,
-        &cache.with_file_name("render-cache.sqlite"),
+    Ok(document)
+}
+
+async fn fetch_html_images(
+    cache: &Path,
+    document: &html_mail::Document,
+    budget: Duration,
+    max_images: usize,
+) -> bool {
+    let mut downloads = stream::iter(
+        document
+            .missing
+            .iter()
+            .take(max_images)
+            .cloned()
+            .collect::<Vec<_>>(),
     )
-    .await
-    .map(Some)
+    .map(|url| async move { remote_image::load(cache, &url).await.is_ok() })
+    .buffer_unordered(4);
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut changed = false;
+    while let Ok(Some(result)) = tokio::time::timeout_at(deadline, downloads.next()).await {
+        changed |= result;
+    }
+    changed
 }
 
 fn cached_document(store: &Store, raw: &[u8]) -> Option<html_mail::Document> {
@@ -555,21 +396,40 @@ impl MailApp {
             return;
         };
         let theme = self.theme;
-        if !self.demo
-            && cached.uses_original_html()
-            && let Some(raw) = &cached.raw
-            && let Some(clicked) = cached
-                .html
-                .show(ui, &self.runtime, &self.path, raw, &message.id)
+        #[cfg(target_os = "linux")]
+        if cached.uses_original_html()
+            && !cached.html.stopped
+            && let Some(document) = cached.html.document.clone()
         {
-            if let Some(url) = clicked {
-                self.open_mail_link(&url);
+            use crate::web_reader::{self, Display};
+            match web_reader::display(
+                ui,
+                &reader_key,
+                document,
+                theme,
+                cached.html.original_colors,
+            ) {
+                Display::Shown => {
+                    if !self.demo
+                        && let Some(raw) = &cached.raw
+                    {
+                        let retry = cached.html.pending.is_none()
+                            && cached.html.attempted_images
+                            && cached
+                                .html
+                                .document
+                                .as_ref()
+                                .is_some_and(|doc| !doc.missing.is_empty())
+                            && ui.small_button("Retry missing images").clicked();
+                        cached
+                            .html
+                            .update_images(ui.ctx(), &self.runtime, &self.path, raw, retry);
+                    }
+                    return;
+                }
+                Display::Failed => cached.html.stopped = true,
+                Display::Unavailable => {}
             }
-            return;
-        }
-        if cached.uses_original_html() && cached.html.pending.is_some() {
-            show_body_preview(ui, &message.body);
-            return;
         }
         let mut clicked = None;
         ui.scope(|ui| {
@@ -684,7 +544,7 @@ impl MailApp {
         }
     }
 
-    fn open_mail_link(&mut self, url: &Url) {
+    pub(crate) fn open_mail_link(&mut self, url: &Url) {
         let opened = ["brave", "brave-browser"].into_iter().any(|bin| {
             std::process::Command::new(bin)
                 .arg(url.as_str())
@@ -703,13 +563,25 @@ impl MailApp {
         else {
             return;
         };
-        if self.demo || reader.body.layout.is_none() {
+        if reader.body.layout.is_none() {
             return;
         }
+        if reader.uses_original_html() && !reader.html.stopped {
+            let caption = if reader.html.original_colors {
+                "Follow app theme"
+            } else {
+                "Show sender colors"
+            };
+            if ui.button(caption).clicked() {
+                reader.html.original_colors = !reader.html.original_colors;
+                ui.close();
+                return;
+            }
+        }
         let (caption, alternate) = if reader.uses_original_html() && !reader.html.stopped {
-            ("Show selectable text", BodyView::Selectable)
+            ("Show simplified message", BodyView::Selectable)
         } else {
-            ("Show original HTML", BodyView::Original)
+            ("Show HTML layout", BodyView::Original)
         };
         let view = if ui.button(caption).clicked() {
             alternate
@@ -721,8 +593,9 @@ impl MailApp {
         match self.store.set_body_view(&key.account, message, view) {
             Ok(()) => {
                 reader.view = view;
-                if reader.html.pending.is_some() || reader.html.stopped {
-                    reader.html = HtmlReader::default();
+                reader.html.stopped = false;
+                if view == BodyView::Selectable && reader.html.pending.take().is_some() {
+                    reader.html.attempted_images = false;
                 }
                 ui.close();
             }

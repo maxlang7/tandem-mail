@@ -652,11 +652,7 @@ impl Store {
                    EXISTS (SELECT 1 FROM messages a
                       WHERE a.account=p.account AND a.thread=p.thread AND a.present=1 AND a.has_files=1),
                    coalesce((SELECT json_group_array(DISTINCT t.label) FROM messages b JOIN tags t ON t.msg=b.pk
-                       WHERE b.account=p.account AND b.thread=p.thread AND b.present=1),'[]'),
-                   coalesce((SELECT a.id FROM messages a
-                       WHERE a.account=p.account AND a.thread=p.thread AND a.present=1
-                         AND NOT EXISTS (SELECT 1 FROM tags WHERE msg=a.pk AND label='DRAFT')
-                       ORDER BY a.date DESC,a.pk DESC LIMIT 1), m.id)
+                       WHERE b.account=p.account AND b.thread=p.thread AND b.present=1),'[]')
             FROM page p CROSS JOIN messages m ON m.pk=p.pk
             ORDER BY p.date DESC,p.account,p.thread");
         let mut stmt = self.0.prepare(&sql)?;
@@ -669,7 +665,6 @@ impl Store {
                     account: r.get(0)?,
                     thread: r.get(1)?,
                 },
-                reader_message: r.get(9)?,
                 senders: serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(),
                 subject: r.get(3)?,
                 snippet: r.get(4)?,
@@ -775,20 +770,57 @@ impl Store {
         }
     }
 
+    pub fn inbox_reader_keys(&self, accounts: &[&str]) -> Result<Vec<(String, String)>> {
+        if accounts.is_empty() {
+            return Ok(vec![]);
+        }
+        let inbox = inbox_reader_filter();
+        let placeholders = std::iter::repeat_n("?", accounts.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = self.0.prepare_cached(&format!(
+            "WITH candidates(pk) AS (
+               SELECT msg FROM tags WHERE label='INBOX'
+               UNION
+               SELECT m.pk FROM mailbox_changes q
+               CROSS JOIN messages m ON m.account=q.account AND m.thread=q.thread
+               WHERE q.inbox=1 AND m.present=1
+             )
+             SELECT m.account, m.id FROM candidates c CROSS JOIN messages m ON m.pk=c.pk
+             WHERE m.present=1 AND {inbox} AND m.account IN ({placeholders})
+             ORDER BY m.date DESC, m.pk DESC"
+        ))?;
+        let values = std::iter::once(Value::Integer(now())).chain(
+            accounts
+                .iter()
+                .map(|account| Value::Text((*account).to_owned())),
+        );
+        let keys = stmt.query_map(params_from_iter(values), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(keys.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn reader_source(
         &self,
         account: &str,
         id: &str,
-        max_bytes: Option<usize>,
+        precache_max_bytes: Option<usize>,
     ) -> Result<Option<(Vec<u8>, String)>> {
+        let mut sql = "SELECT m.raw, m.body FROM messages m
+                       WHERE m.account=?1 AND m.id=?2 AND m.present=1"
+            .to_owned();
+        let mut values = vec![Value::Text(account.into()), Value::Text(id.into())];
+        if let Some(max_bytes) = precache_max_bytes {
+            sql.push_str(&format!(" AND m.size<=?3 AND {}", inbox_reader_filter()));
+            values.extend([Value::Integer(max_bytes.try_into()?), Value::Integer(now())]);
+        }
         Ok(self
             .0
-            .query_row(
-                "SELECT raw, body FROM messages
-             WHERE account=?1 AND id=?2 AND present=1 AND (?3 IS NULL OR size<=?3)",
-                params![account, id, max_bytes],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .prepare_cached(&sql)?
+            .query_row(params_from_iter(values), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()?)
     }
 
@@ -1080,6 +1112,15 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+fn inbox_reader_filter() -> String {
+    format!(
+        "({IN_INBOX})
+        AND NOT EXISTS (SELECT 1 FROM tags WHERE msg=m.pk AND label IN ('SPAM','TRASH','DRAFT'))
+        AND NOT EXISTS (SELECT 1 FROM snoozes s
+            WHERE s.account=m.account AND s.thread=m.thread AND s.due>?)"
+    )
 }
 
 pub fn now() -> i64 {

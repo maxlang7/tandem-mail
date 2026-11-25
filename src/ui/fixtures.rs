@@ -120,7 +120,22 @@ pub fn seed_demo(store: &mut Store, accounts: &[Account]) -> Result<()> {
         )?;
         let entries = samples.iter().enumerate().filter(|(i, _)| i % accounts.len() == account_index)
             .map(|(i, (sender, text, body))| {
-                let raw = format!("From: {sender} <sender{i}@example.org>\r\nTo: {}\r\nSubject: {text}\r\nMessage-ID: <sample{i}@example.org>\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{body}\r\n", account.email);
+                let content = if i == 3 {
+                    let newsletter = seminar_newsletter(body);
+                    format!(
+                        concat!(
+                            "Content-Type: multipart/alternative; boundary=seminar\r\n\r\n",
+                            "--seminar\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{body}\r\n",
+                            "--seminar\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n{newsletter}\r\n",
+                            "--seminar--\r\n"
+                        ),
+                        body = body,
+                        newsletter = newsletter,
+                    )
+                } else {
+                    format!("Content-Type: text/plain; charset=UTF-8\r\n\r\n{body}\r\n")
+                };
+                let raw = format!("From: {sender} <sender{i}@example.org>\r\nTo: {}\r\nSubject: {text}\r\nMessage-ID: <sample{i}@example.org>\r\n{content}", account.email);
                 let category = match i {
                     3 | 5 | 7 | 10 | 13 => "CATEGORY_UPDATES",
                     6 | 12 => "CATEGORY_SOCIAL",
@@ -141,4 +156,22 @@ pub fn seed_demo(store: &mut Store, accounts: &[Account]) -> Result<()> {
     }
     store.save_search("Unread with attachments", "is:unread has:attachment", None)?;
     Ok(())
+}
+
+fn seminar_newsletter(intro: &str) -> String {
+    format!(
+        r##"<body style="background: #eeeeee">
+    <table align="center" width="550" cellspacing="0" cellpadding="20" bgcolor="#ffffff">
+      <tr><td style="background: #23378b; color: white"><h1>Department seminar</h1></td></tr>
+      <tr><td style="color: #222222">
+        <h2>Radical chemistry</h2>
+        <p>{intro}</p>
+        <h2>About the talk</h2>
+        <p>The seminar will cover how changes to a reaction's conditions affect the lifetime
+        of radical intermediates, and what those changes can tell us about the mechanism.</p>
+        <a href="https://example.org/seminar">Read the seminar abstract</a>
+      </td></tr>
+    </table>
+    </body>"##
+    )
 }

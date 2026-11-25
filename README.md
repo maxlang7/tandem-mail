@@ -38,7 +38,11 @@ The demo uses an in-memory mailbox and does not connect to Gmail. To use real ma
 nix-shell --run 'cargo run --locked -j 3'
 ```
 
-The shell supplies Rust, build tools, graphics libraries, and a bold font. HTML mail rendering also needs Brave available on `PATH`. Other Linux distributions need the equivalent Wayland or X11, OpenGL, D-Bus, and keyboard libraries. Platforms other than Linux are untested.
+The shell supplies Rust, GTK 3, WebKitGTK 4.1, graphics libraries, and a bold font.
+The inline HTML reader uses X11, including XWayland on Wayland desktops.
+A Wayland session without XWayland uses the simplified reader. Tandem opens
+message links in Brave, which must be available on `PATH`. Platforms other
+than Linux are untested.
 
 To prepare the local release launcher:
 
@@ -112,24 +116,21 @@ actions and sending, and Gmail settings access for server-side filters.
   picker, which uses Yazi on Aragorn. **Download all** saves every attachment in
   the message to the same folder. Right-click and choose **Save to Downloads**
   for a quick save. The **Message** menu can also export the original `.eml`.
-- The reader uses Gruvbox for ordinary messages and Brave for designed emails such
-  as Ed notifications. Use the **Message** menu to switch views or restore Auto
-  for an individual message. Public remote images load automatically in the
-  background and remain available offline after downloading. The reader hides
-  known tracking pixels. A remote server can still learn when Tandem fetches an
-  image from it.
-- Rich mail reuses one isolated Brave renderer, pauses it between jobs, and
-  closes it after 15 seconds without work. Lossless captures preserve text,
-  inline images, and clickable link geometry. Finished captures also live in a
-  separate `render-cache.sqlite` beside the mailbox, with a 128 MiB data budget
-  and at most 256 entries. SQLite can retain up to one extra entry's allocated
-  space for reuse. Content, image, width, and density changes invalidate a
-  capture. Cache failures fall back to rendering the message.
+- In Auto, the reader uses the simplified view for ordinary mail and live
+  WebKitGTK for designed mail. Use the **Message** menu to switch layouts or
+  show the sender's colors. By default HTML messages use Tandem's palette,
+  and text can be selected and copied directly.
+- Tandem prepares inbox mail in the background across accounts, even while
+  another view is open. Archiving cancels that message's preload.
+- Public remote images can load during preloading and remain available offline
+  after downloading. Tandem hides known tracking pixels. A remote server can
+  still learn when Tandem fetches an image from it.
 
 ### Rendering benchmark
 
-The offline benchmark generates short notifications, long newsletters, and
-high-density messages. It never reads the mailbox or downloads images.
+The offline benchmark measures the previous Brave screenshot renderer. It
+generates short notifications, long newsletters, and high-density messages
+without reading the mailbox or downloading images.
 
 ```sh
 nix-shell --run 'cargo build --release --locked -j 3'
